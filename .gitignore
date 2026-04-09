@@ -27,3 +27,7 @@ target
 
 # Scene data — never commit .ply files
 *.ply
+
+# Fetched 3DGS assets (see scripts/download-garden-ply.sh)
+/data/3dgs/*
+!/data/3dgs/.gitkeep
