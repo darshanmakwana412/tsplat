@@ -1,0 +1,16 @@
+[package]
+name = "tsplat"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+glam = "0.29"
+crossterm = "0.28"
+rayon = "1.10"
+ply-rs = "0.1"
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

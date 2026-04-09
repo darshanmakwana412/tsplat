@@ -1,0 +1,189 @@
+use glam::{Mat2, Mat3, Vec2, Vec3, Vec4};
+use rayon::prelude::*;
+
+use crate::camera::OrbitCamera;
+use crate::splat::Splat;
+
+/// Per-splat intermediate produced during projection. Everything a pixel loop
+/// needs is baked in here — there's no reason to revisit the original `Splat`
+/// struct during composite.
+#[derive(Clone, Copy)]
+pub struct Projected {
+    pub screen: Vec2,
+    pub depth: f32,
+    pub cov2d_inv: Mat2,
+    pub bbox: [i32; 4], // inclusive: x0, y0, x1, y1
+    pub color: Vec3,
+    pub opacity: f32,
+}
+
+/// Low-pass dilation constant added to the Cov2D diagonal to guarantee each
+/// splat covers at least ~one pixel. Matches LichtFeld's `eps2d = 0.3`.
+const EPS2D: f32 = 0.3;
+
+/// Skip a splat entirely once its effective alpha would be below this.
+/// Matches LichtFeld's `ALPHA_THRESHOLD = 1 / 255`.
+const ALPHA_THRESHOLD: f32 = 1.0 / 255.0;
+
+/// Splat bbox extent in units of stddev. 3σ ≈ 99.7% of the Gaussian mass.
+const EXTEND_SIGMA: f32 = 3.0;
+
+/// Early-out: once a pixel's accumulated alpha exceeds this, no more splats
+/// can contribute a visible amount.
+const SATURATION: f32 = 0.999;
+
+/// Project every splat. Parallel over splats (embarrassingly parallel).
+pub fn project(splats: &[Splat], camera: &OrbitCamera) -> Vec<Projected> {
+    let view = camera.view();
+    let w_mat = Mat3::from_mat4(view);
+    let (fx, fy, cx, cy) = camera.intrinsics();
+    let w_i = camera.width as i32;
+    let h_i = camera.height as i32;
+    let znear = camera.znear;
+    let zfar = camera.zfar;
+
+    splats
+        .par_iter()
+        .filter_map(|s| {
+            // ---- View-transform center ----
+            // RH view: camera looks down -z, so a point in front has z < 0.
+            let p_view4 = view * Vec4::new(s.pos.x, s.pos.y, s.pos.z, 1.0);
+            let p_view = Vec3::new(p_view4.x, p_view4.y, p_view4.z);
+            if p_view.z > -znear || p_view.z < -zfar {
+                return None;
+            }
+            // Work with positive depth (zc > 0 means "in front").
+            let zc = -p_view.z;
+            let xv = p_view.x;
+            let yv = p_view.y;
+
+            // ---- 3D covariance: Σ = R S Sᵀ Rᵀ = (RS)(RS)ᵀ ----
+            let r_mat = Mat3::from_quat(s.rot);
+            let s_mat = Mat3::from_diagonal(s.scale);
+            let m = r_mat * s_mat;
+            let cov3d = m * m.transpose();
+
+            // ---- Rotate covariance into view space ----
+            let cov3d_view = w_mat * cov3d * w_mat.transpose();
+
+            // ---- Jacobian of pinhole projection at (xv, yv, zv) ----
+            // Projection (y-down framebuffer, RH view space with zc = -zv):
+            //   u =  fx * xv / zc + cx
+            //   v = -fy * yv / zc + cy       (flip so world-up → screen-up)
+            //
+            // ∂u/∂xv =  fx/zc
+            // ∂u/∂zv =  fx * xv / zc²
+            // ∂v/∂yv = -fy/zc
+            // ∂v/∂zv = -fy * yv / zc²
+            //
+            // Pad to 3x3 (third row zero) so glam's Mat3 multiplication works.
+            let zc2 = zc * zc;
+            let j = Mat3::from_cols(
+                Vec3::new(fx / zc, 0.0, 0.0),
+                Vec3::new(0.0, -fy / zc, 0.0),
+                Vec3::new(fx * xv / zc2, -fy * yv / zc2, 0.0),
+            );
+
+            let jcov = j * cov3d_view * j.transpose();
+
+            // Top-left 2x2 is the 2D image-plane covariance; the rest is 0
+            // because the third row of J was zero.
+            let mut cov2d = Mat2::from_cols(
+                Vec2::new(jcov.x_axis.x, jcov.x_axis.y),
+                Vec2::new(jcov.y_axis.x, jcov.y_axis.y),
+            );
+            // Low-pass dilation on the diagonal.
+            cov2d.x_axis.x += EPS2D;
+            cov2d.y_axis.y += EPS2D;
+
+            let det = cov2d.determinant();
+            if det <= 0.0 {
+                return None;
+            }
+
+            // Largest eigenvalue → 3σ bbox radius.
+            let a = cov2d.x_axis.x;
+            let d = cov2d.y_axis.y;
+            let b = 0.5 * (a + d);
+            let lambda1 = b + (b * b - det).max(0.01).sqrt();
+            let radius_f = EXTEND_SIGMA * lambda1.sqrt();
+            if !radius_f.is_finite() || radius_f < 1.0 {
+                return None;
+            }
+            let radius = radius_f.ceil() as i32;
+
+            let cov2d_inv = cov2d.inverse();
+
+            // ---- Project center to pixel coords ----
+            let sx = fx * xv / zc + cx;
+            let sy = -fy * yv / zc + cy;
+
+            let x0 = (sx - radius as f32).floor() as i32;
+            let y0 = (sy - radius as f32).floor() as i32;
+            let x1 = (sx + radius as f32).ceil() as i32;
+            let y1 = (sy + radius as f32).ceil() as i32;
+
+            // Clip to framebuffer.
+            let x0 = x0.max(0);
+            let y0 = y0.max(0);
+            let x1 = x1.min(w_i - 1);
+            let y1 = y1.min(h_i - 1);
+            if x0 > x1 || y0 > y1 {
+                return None;
+            }
+
+            Some(Projected {
+                screen: Vec2::new(sx, sy),
+                depth: zc,
+                cov2d_inv,
+                bbox: [x0, y0, x1, y1],
+                color: s.color,
+                opacity: s.opacity,
+            })
+        })
+        .collect()
+}
+
+/// Sort front-to-back (smaller view-space depth = closer to camera).
+/// `sort_unstable_by` — this is the hot loop, stability doesn't matter.
+pub fn sort_by_depth(projected: &mut [Projected]) {
+    projected.sort_unstable_by(|a, b| {
+        a.depth
+            .partial_cmp(&b.depth)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+}
+
+/// Front-to-back alpha composite into the RGB framebuffer.
+///
+/// `fb` is a packed `(rgb, accum_alpha)` buffer of length `width * height`,
+/// assumed to be zeroed at the start of each frame.
+pub fn composite(projected: &[Projected], fb: &mut [(Vec3, f32)], width: u32, _height: u32) {
+    let w = width as usize;
+    for p in projected {
+        let [x0, y0, x1, y1] = p.bbox;
+        for py in y0..=y1 {
+            let row = py as usize * w;
+            for px in x0..=x1 {
+                let idx = row + px as usize;
+                let cell = &mut fb[idx];
+                if cell.1 >= SATURATION {
+                    continue;
+                }
+                let d = Vec2::new(px as f32 - p.screen.x, py as f32 - p.screen.y);
+                let power = -0.5 * d.dot(p.cov2d_inv * d);
+                if power > 0.0 {
+                    continue;
+                }
+                let alpha = (p.opacity * power.exp()).min(0.999);
+                if alpha < ALPHA_THRESHOLD {
+                    continue;
+                }
+                let t = 1.0 - cell.1;
+                let contrib = t * alpha;
+                cell.0 += contrib * p.color;
+                cell.1 += contrib;
+            }
+        }
+    }
+}
