@@ -1,18 +1,17 @@
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use glam::{Quat, Vec3};
-use ply_rs::parser::Parser;
-use ply_rs::ply::{DefaultElement, Property};
+use std::collections::HashMap;
 use std::fs::File;
-use std::io::BufReader;
+use std::io::{BufRead, BufReader, Read};
 use std::path::Path;
 
 use crate::sh::sh_band0_to_rgb;
 
 /// One 3D Gaussian, fully decoded and ready to render.
 ///
-/// All values are in their "real" (linear) form — log-space scales have been
-/// exponentiated, the quaternion has been normalized, the band-0 SH DC has
-/// been converted to RGB, and the raw opacity logit has been sigmoid'd.
+/// All values are already in their linear form — log-space scales have been
+/// exponentiated, the quaternion normalised, SH band-0 converted to RGB, and
+/// the raw opacity logit has been sigmoid'd.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct Splat {
@@ -23,88 +22,146 @@ pub struct Splat {
     pub opacity: f32,
 }
 
-fn get_f32(el: &DefaultElement, key: &str) -> Result<f32> {
-    match el.get(key) {
-        Some(Property::Float(v)) => Ok(*v),
-        Some(Property::Double(v)) => Ok(*v as f32),
-        Some(other) => Err(anyhow!("property {key} has unexpected type {other:?}")),
-        None => Err(anyhow!("missing property {key}")),
-    }
-}
-
 #[inline]
 fn sigmoid(x: f32) -> f32 {
     1.0 / (1.0 + (-x).exp())
 }
 
-/// Load an INRIA 3DGS `.ply` file into `Vec<Splat>`.
+/// Load an INRIA 3DGS `.ply` file into at most `max_splats` `Splat`s.
 ///
-/// `apply_sigmoid_opacity` should be `true` for vanilla INRIA `.ply` files
-/// (opacity is stored as a pre-sigmoid logit). If the scene looks hazy /
-/// ~50% transparent, flip this to `false`.
-pub fn load_ply(path: &Path, apply_sigmoid_opacity: bool) -> Result<Vec<Splat>> {
+/// Subsampling is done during the read — we never hold more than `max_splats`
+/// decoded records in memory at once.  `max_splats == 0` means "load all".
+///
+/// `apply_sigmoid_opacity`: `true` for vanilla INRIA files (opacity stored as
+/// a pre-sigmoid logit).  Pass `false` if the scene looks uniformly hazy.
+pub fn load_ply(path: &Path, apply_sigmoid_opacity: bool, max_splats: usize) -> Result<Vec<Splat>> {
     let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
-    let mut reader = BufReader::new(file);
-    let parser = Parser::<DefaultElement>::new();
-    let ply = parser
-        .read_ply(&mut reader)
-        .with_context(|| format!("parsing {}", path.display()))?;
+    // Large read buffer — the binary body can be hundreds of MB.
+    let mut reader = BufReader::with_capacity(4 * 1024 * 1024, file);
 
-    let vertices = ply
-        .payload
-        .get("vertex")
-        .ok_or_else(|| anyhow!("no 'vertex' element in {}", path.display()))?;
+    // ---- Parse ASCII header -----------------------------------------------
+    // The header is a sequence of ASCII lines terminated by "end_header\n".
+    let mut vertex_count: usize = 0;
+    let mut prop_names: Vec<String> = Vec::new();
+    let mut in_vertex = false;
 
-    let mut splats = Vec::with_capacity(vertices.len());
-    for v in vertices {
-        let x = get_f32(v, "x")?;
-        let y = get_f32(v, "y")?;
-        let z = get_f32(v, "z")?;
+    loop {
+        let mut line = String::new();
+        reader
+            .read_line(&mut line)
+            .context("reading PLY header")?;
+        if line.is_empty() {
+            bail!("unexpected EOF inside PLY header");
+        }
+        let t = line.trim_end();
 
-        let f0 = get_f32(v, "f_dc_0")?;
-        let f1 = get_f32(v, "f_dc_1")?;
-        let f2 = get_f32(v, "f_dc_2")?;
+        if t == "end_header" {
+            break;
+        }
+        if t.starts_with("format") {
+            // We only handle binary_little_endian.
+            if !t.contains("binary_little_endian") {
+                bail!("only binary_little_endian PLY is supported (got: {t})");
+            }
+        } else if t.starts_with("element vertex") {
+            in_vertex = true;
+            vertex_count = t
+                .split_whitespace()
+                .last()
+                .and_then(|s| s.parse().ok())
+                .with_context(|| format!("cannot parse vertex count from: {t}"))?;
+        } else if t.starts_with("element") {
+            // Some other element (e.g. face) — stop collecting properties.
+            in_vertex = false;
+        } else if in_vertex && t.starts_with("property float") {
+            let name = t
+                .split_whitespace()
+                .nth(2)
+                .ok_or_else(|| anyhow!("property line has no name: {t}"))?
+                .to_string();
+            prop_names.push(name);
+        }
+        // Ignore "property double", "property int", comments, obj_info, etc.
+        // INRIA 3DGS PLY files use only float32 for all vertex properties.
+    }
 
-        // INRIA stores log-space scales.
-        let s0 = get_f32(v, "scale_0")?;
-        let s1 = get_f32(v, "scale_1")?;
-        let s2 = get_f32(v, "scale_2")?;
+    if vertex_count == 0 {
+        bail!("PLY has no vertex element or vertex count is 0");
+    }
 
-        // INRIA stores rot in wxyz order. glam Quat::from_xyzw takes xyzw.
-        let rw = get_f32(v, "rot_0")?;
-        let rx = get_f32(v, "rot_1")?;
-        let ry = get_f32(v, "rot_2")?;
-        let rz = get_f32(v, "rot_3")?;
+    // Each property is a 4-byte float32 → fixed stride.
+    let stride = prop_names.len() * 4;
 
-        let op_raw = get_f32(v, "opacity")?;
+    // Build name → byte-offset map.
+    let offsets: HashMap<&str, usize> = prop_names
+        .iter()
+        .enumerate()
+        .map(|(i, n)| (n.as_str(), i * 4))
+        .collect();
 
-        let pos = Vec3::new(x, y, z);
-        let scale = Vec3::new(s0.exp(), s1.exp(), s2.exp());
-        let rot = Quat::from_xyzw(rx, ry, rz, rw).normalize();
-        let color = sh_band0_to_rgb(Vec3::new(f0, f1, f2));
+    let get = |key: &str| -> Result<usize> {
+        offsets
+            .get(key)
+            .copied()
+            .with_context(|| format!("PLY is missing required property '{key}'"))
+    };
+
+    let off_x  = get("x")?;
+    let off_y  = get("y")?;
+    let off_z  = get("z")?;
+    let off_f0 = get("f_dc_0")?;
+    let off_f1 = get("f_dc_1")?;
+    let off_f2 = get("f_dc_2")?;
+    let off_s0 = get("scale_0")?;
+    let off_s1 = get("scale_1")?;
+    let off_s2 = get("scale_2")?;
+    let off_rw = get("rot_0")?; // INRIA: rot_0 = w component
+    let off_rx = get("rot_1")?;
+    let off_ry = get("rot_2")?;
+    let off_rz = get("rot_3")?;
+    let off_op = get("opacity")?;
+
+    // ---- Compute subsampling stride ---------------------------------------
+    let (step, capacity) = if max_splats == 0 || vertex_count <= max_splats {
+        (1usize, vertex_count)
+    } else {
+        (vertex_count / max_splats, max_splats)
+    };
+
+    let mut splats = Vec::with_capacity(capacity);
+
+    // ---- Stream the binary body ------------------------------------------
+    // Read one fixed-size vertex record at a time; decode only the fields we
+    // need; skip records that fall outside the uniform subsample stride.
+    let mut record = vec![0u8; stride];
+
+    for i in 0..vertex_count {
+        reader
+            .read_exact(&mut record)
+            .with_context(|| format!("reading vertex {i}"))?;
+
+        if i % step != 0 {
+            continue;
+        }
+        if max_splats > 0 && splats.len() >= max_splats {
+            break;
+        }
+
+        let f = |off: usize| f32::from_le_bytes(record[off..off + 4].try_into().unwrap());
+
+        let pos   = Vec3::new(f(off_x), f(off_y), f(off_z));
+        let scale = Vec3::new(f(off_s0).exp(), f(off_s1).exp(), f(off_s2).exp());
+        // INRIA quaternion order is wxyz; glam Quat::from_xyzw wants xyzw.
+        let rot   = Quat::from_xyzw(f(off_rx), f(off_ry), f(off_rz), f(off_rw)).normalize();
+        let color = sh_band0_to_rgb(Vec3::new(f(off_f0), f(off_f1), f(off_f2)));
         let opacity = if apply_sigmoid_opacity {
-            sigmoid(op_raw)
+            sigmoid(f(off_op))
         } else {
-            op_raw.clamp(0.0, 1.0)
+            f(off_op).clamp(0.0, 1.0)
         };
 
-        splats.push(Splat {
-            pos,
-            scale,
-            rot,
-            color,
-            opacity,
-        });
+        splats.push(Splat { pos, scale, rot, color, opacity });
     }
-    Ok(splats)
-}
 
-/// Uniformly subsample a splat vector down to at most `max` entries by
-/// striding. `max == 0` means "don't cap".
-pub fn downsample_uniform(splats: Vec<Splat>, max: usize) -> Vec<Splat> {
-    if max == 0 || splats.len() <= max {
-        return splats;
-    }
-    let step = (splats.len() / max).max(1);
-    splats.into_iter().step_by(step).take(max).collect()
+    Ok(splats)
 }

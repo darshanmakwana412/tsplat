@@ -19,7 +19,7 @@ mod splat;
 
 use camera::OrbitCamera;
 use rasterize::{composite, project, sort_by_depth};
-use splat::{Splat, downsample_uniform, load_ply};
+use splat::{Splat, load_ply};
 
 #[derive(ClapParser, Debug)]
 #[command(
@@ -86,12 +86,10 @@ fn scene_bounds(splats: &[Splat]) -> (Vec3, f32) {
 fn main() -> Result<()> {
     let args = Args::parse();
 
-    eprintln!("loading {} ...", args.ply.display());
-    let splats = load_ply(&args.ply, !args.raw_opacity)?;
-    let total = splats.len();
     let cap = if args.no_cap { 0 } else { args.max_splats };
-    let splats = downsample_uniform(splats, cap);
-    eprintln!("loaded {} splats (from {})", splats.len(), total);
+    eprintln!("loading {} (cap: {}) ...", args.ply.display(), if cap == 0 { "none".into() } else { cap.to_string() });
+    let splats = load_ply(&args.ply, !args.raw_opacity, cap)?;
+    eprintln!("loaded {} splats", splats.len());
 
     if args.dump_stats {
         return Ok(());
