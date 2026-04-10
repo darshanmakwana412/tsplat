@@ -334,9 +334,22 @@ pub fn composite_parallel(
                     let opacity = p.opacity;
                     let color = p.color;
 
+                    // Pre-compute the row_base threshold: if the dy² term alone
+                    // makes alpha negligible, skip the entire row.
+                    // opacity * exp(row_base) < alpha_threshold
+                    // row_base < ln(alpha_threshold / opacity)
+                    let row_base_cutoff = (alpha_threshold / opacity).ln();
+
                     for py in py_start..=py_end {
                         let dy = py as f32 - p.screen.y;
                         let row_base = dy_coeff * dy * dy;
+
+                        // Early-out: if the Gaussian's dy² term alone is too
+                        // small, no pixel on this row can contribute.
+                        if row_base < row_base_cutoff {
+                            continue;
+                        }
+
                         let row_slope = cross_coeff * dy;
                         let local_row = (py - tile_y0) as usize * w;
 
