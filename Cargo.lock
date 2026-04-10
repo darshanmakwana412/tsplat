@@ -704,6 +704,7 @@ dependencies = [
  "criterion",
  "crossterm",
  "glam",
+ "libc",
  "rayon",
 ]
 

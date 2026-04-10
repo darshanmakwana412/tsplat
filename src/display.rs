@@ -4,6 +4,37 @@ use std::time::Duration;
 
 use crate::framebuffer;
 
+/// Kitty `z=` so the splat image stays *under* text. Default stacking paints the
+/// image above cells, so every `a=T` refresh briefly covers FPS/HUD. Values below
+/// `INT32_MIN / 2` are required for cells with explicit SGR backgrounds (HUD).
+const KITTY_IMG_Z_UNDER_UI: i32 = -1_073_741_825;
+
+// ── TTY poll (avoid crossterm during Kitty probe / cell-size query) ─────────
+//
+// `crossterm::event::poll` reads from the tty and feeds bytes through its
+// escape parser. Kitty graphics replies (`ESC _ G …`) are not crossterm events;
+// the parser clears them as garbage. Using poll+read here would make
+// `probe_kitty_support` always fail and force HalfBlock mode.
+
+#[cfg(unix)]
+fn open_tty_for_read() -> io::Result<std::fs::File> {
+    std::fs::OpenOptions::new().read(true).open("/dev/tty")
+}
+
+#[cfg(unix)]
+fn tty_poll_readable(fd: std::os::unix::io::RawFd, timeout_ms: i32) -> io::Result<bool> {
+    let mut pfd = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let n = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
+    if n < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(n > 0 && (pfd.revents & libc::POLLIN) != 0)
+}
+
 // ── Backend enum ────────────────────────────────────────────────────────────
 
 /// Which rendering backend we're using to get pixels on screen.
@@ -47,24 +78,37 @@ impl Default for CellSize {
 /// Probe whether the terminal supports the Kitty graphics protocol.
 /// Must be called while the terminal is in raw mode.
 pub fn probe_kitty_support() -> bool {
-    let mut stdout = io::stdout().lock();
-
-    // Send graphics query (a=q) with a 1×1 RGB pixel, plus DA1 as a fence.
-    let probe = b"\x1b_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\\x1b[c";
-    if stdout.write_all(probe).is_err() || stdout.flush().is_err() {
+    #[cfg(not(unix))]
+    {
         return false;
     }
 
-    let mut buf = [0u8; 256];
-    let mut filled = 0usize;
-    let deadline = std::time::Instant::now() + Duration::from_millis(500);
+    #[cfg(unix)]
+    {
+        let mut tty_in = match open_tty_for_read() {
+            Ok(f) => f,
+            Err(_) => return false,
+        };
+        use std::os::unix::io::AsRawFd;
+        let tty_fd = tty_in.as_raw_fd();
 
-    let stdin = io::stdin();
-    let mut handle = stdin.lock();
+        let mut stdout = io::stdout().lock();
 
-    while std::time::Instant::now() < deadline && filled < buf.len() {
-        if crossterm::event::poll(Duration::from_millis(50)).unwrap_or(false) {
-            match handle.read(&mut buf[filled..]) {
+        // Send graphics query (a=q) with a 1×1 RGB pixel, plus DA1 as a fence.
+        let probe = b"\x1b_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\\x1b[c";
+        if stdout.write_all(probe).is_err() || stdout.flush().is_err() {
+            return false;
+        }
+
+        let mut buf = [0u8; 256];
+        let mut filled = 0usize;
+        let deadline = std::time::Instant::now() + Duration::from_millis(500);
+
+        while std::time::Instant::now() < deadline && filled < buf.len() {
+            if !tty_poll_readable(tty_fd, 50).unwrap_or(false) {
+                continue;
+            }
+            match tty_in.read(&mut buf[filled..]) {
                 Ok(0) => break,
                 Ok(n) => {
                     filled += n;
@@ -79,14 +123,27 @@ pub fn probe_kitty_support() -> bool {
                 Err(_) => break,
             }
         }
-    }
 
-    false
+        false
+    }
 }
 
 fn contains_kitty_ok(buf: &[u8]) -> bool {
-    let pattern = b"\x1b_Gi=31;OK\x1b\\";
-    buf.windows(pattern.len()).any(|w| w == pattern)
+    let st_backslash = b"\x1b_Gi=31;OK\x1b\\";
+    let st_string_term = b"\x1b_Gi=31;OK\x9c";
+    buf.windows(st_backslash.len())
+        .any(|w| w == st_backslash)
+        || buf
+            .windows(st_string_term.len())
+            .any(|w| w == st_string_term)
+        || contains_subseq(buf, b"i=31;OK")
+}
+
+/// Loose match for terminals that elide pieces of the APC wrapper.
+fn contains_subseq(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack
+        .windows(needle.len())
+        .any(|window| window == needle)
 }
 
 fn contains_da1_response(buf: &[u8]) -> bool {
@@ -104,40 +161,57 @@ fn contains_da1_response(buf: &[u8]) -> bool {
 
 /// Query terminal cell pixel size via CSI 16 t.
 pub fn query_cell_size() -> Option<CellSize> {
-    let mut stdout = io::stdout().lock();
-
-    // CSI 16 t → response: CSI 6 ; height ; width t
-    let query = b"\x1b[16t\x1b[c";
-    if stdout.write_all(query).is_err() || stdout.flush().is_err() {
+    #[cfg(not(unix))]
+    {
         return None;
     }
 
-    let mut buf = [0u8; 128];
-    let mut filled = 0usize;
-    let deadline = std::time::Instant::now() + Duration::from_millis(300);
+    #[cfg(unix)]
+    {
+        let mut tty_in = open_tty_for_read().ok()?;
+        use std::os::unix::io::AsRawFd;
+        let tty_fd = tty_in.as_raw_fd();
 
-    let stdin = io::stdin();
-    let mut handle = stdin.lock();
+        let mut stdout = io::stdout().lock();
 
-    while std::time::Instant::now() < deadline && filled < buf.len() {
-        if crossterm::event::poll(Duration::from_millis(50)).unwrap_or(false) {
-            match handle.read(&mut buf[filled..]) {
+        // CSI 16 t → response: CSI 6 ; height ; width t
+        let query = b"\x1b[16t\x1b[c";
+        if stdout.write_all(query).is_err() || stdout.flush().is_err() {
+            return None;
+        }
+
+        let mut buf = [0u8; 256];
+        let mut filled = 0usize;
+        let deadline = std::time::Instant::now() + Duration::from_millis(300);
+
+        // Do not bail out on the first DA1 (`\x1b[?…c`): a successful Kitty graphics
+        // probe leaves the *previous* query's DA1 reply in the queue (the probe ends
+        // with `\x1b[c`). Treating that as "CSI 16t unsupported" breaks cell-size
+        // discovery and keeps the default 1×2 cell → same resolution as half-blocks.
+        while std::time::Instant::now() < deadline && filled < buf.len() {
+            if !tty_poll_readable(tty_fd, 50).unwrap_or(false) {
+                continue;
+            }
+            match tty_in.read(&mut buf[filled..]) {
                 Ok(0) => break,
                 Ok(n) => {
                     filled += n;
                     if let Some(cs) = parse_cell_size_response(&buf[..filled]) {
+                        // This query ends with `\x1b[c`; read the matching DA1 so the
+                        // main event loop does not inherit stray escape input.
+                        let mut drain = [0u8; 256];
+                        if tty_poll_readable(tty_fd, 20).unwrap_or(false) {
+                            let _ = tty_in.read(&mut drain);
+                        }
                         return Some(cs);
-                    }
-                    if contains_da1_response(&buf[..filled]) {
-                        return None;
                     }
                 }
                 Err(_) => break,
             }
         }
-    }
 
-    None
+        None
+    }
 }
 
 fn parse_cell_size_response(buf: &[u8]) -> Option<CellSize> {
@@ -327,12 +401,12 @@ impl Display {
                 // First chunk with full metadata.
                 // a=T transmit+display, f=24 RGB, t=d direct,
                 // s/v pixel dims, c/r cell dims for scaling,
-                // i=id p=1 for flicker-free replacement, q=2 suppress response.
+                // i=id p=1 for flicker-free replacement, q=2 suppress response,
                 use std::fmt::Write;
                 let _ = write!(
                     self.frame,
-                    "\x1b_Ga=T,f=24,t=d,s={},v={},c={},r={},i={},p=1,q=2,m={};",
-                    width, height, self.cols, self.rows, self.kitty_img_id, m,
+                    "\x1b_Ga=T,f=24,t=d,s={},v={},c={},r={},i={},p=1,q=2,z={},m={};",
+                    width, height, self.cols, self.rows, self.kitty_img_id, KITTY_IMG_Z_UNDER_UI, m,
                 );
             } else {
                 use std::fmt::Write;
