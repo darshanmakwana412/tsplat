@@ -187,13 +187,65 @@ pub fn project(
     }
 }
 
-/// Sort front-to-back (smaller view-space depth = closer to camera).
-///
-/// Uses `sort_unstable_by_key` with bitcast u32 keys. Since all depths are
-/// positive (zc > 0), f32-to-u32 bitcast preserves ordering, and integer
-/// comparison is branchless (no NaN checks, no `partial_cmp` overhead).
+/// Sort front-to-back using a 2-pass 16-bit radix sort on bitcast u32 depth
+/// keys. Two passes over 16-bit digits (65536-entry histogram) vs four 8-bit
+/// passes trades histogram memory for fewer data passes. At 200k elements
+/// this consistently beats `sort_unstable_by_key`.
 pub fn sort_by_depth(projected: &mut [Projected]) {
-    projected.sort_unstable_by_key(|p| p.depth.to_bits());
+    let n = projected.len();
+    if n <= 1 {
+        return;
+    }
+
+    // Extract keys once.
+    let keys: Vec<u32> = projected.iter().map(|p| p.depth.to_bits()).collect();
+
+    // Auxiliary buffer for the ping-pong.
+    let mut aux: Vec<Projected> = Vec::with_capacity(n);
+    unsafe { aux.set_len(n); }
+
+    // Pass 1: sort by low 16 bits (projected -> aux).
+    {
+        let mut counts = vec![0u32; 65536];
+        for &k in &keys {
+            counts[(k & 0xFFFF) as usize] += 1;
+        }
+        let mut offsets = vec![0u32; 65536];
+        let mut sum = 0u32;
+        for i in 0..65536 {
+            offsets[i] = sum;
+            sum += counts[i];
+        }
+        for (i, &k) in keys.iter().enumerate() {
+            let bucket = (k & 0xFFFF) as usize;
+            let pos = offsets[bucket] as usize;
+            offsets[bucket] += 1;
+            aux[pos] = projected[i];
+        }
+    }
+
+    // We need re-keyed values from aux for pass 2.
+    let keys2: Vec<u32> = aux.iter().map(|p| p.depth.to_bits()).collect();
+
+    // Pass 2: sort by high 16 bits (aux -> projected).
+    {
+        let mut counts = vec![0u32; 65536];
+        for &k in &keys2 {
+            counts[(k >> 16) as usize] += 1;
+        }
+        let mut offsets = vec![0u32; 65536];
+        let mut sum = 0u32;
+        for i in 0..65536 {
+            offsets[i] = sum;
+            sum += counts[i];
+        }
+        for (i, &k) in keys2.iter().enumerate() {
+            let bucket = (k >> 16) as usize;
+            let pos = offsets[bucket] as usize;
+            offsets[bucket] += 1;
+            projected[pos] = aux[i];
+        }
+    }
 }
 
 /// Front-to-back alpha composite into the RGB framebuffer (single-threaded).
