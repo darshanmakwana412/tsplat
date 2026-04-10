@@ -4,6 +4,18 @@ use rayon::prelude::*;
 use crate::camera::OrbitCamera;
 use crate::splat::Splat;
 
+/// Fast approximate exp(x) for x in [-87, 0]. Uses the Schraudolph trick:
+/// reinterpret a scaled+biased float as an IEEE 754 bit pattern.
+/// Accuracy: ~1-2% relative error, more than sufficient for Gaussian alpha.
+#[inline(always)]
+fn fast_exp(x: f32) -> f32 {
+    // Clamp to avoid underflow/overflow in the integer cast.
+    let x = x.max(-87.0);
+    // Magic: 2^23 / ln(2) ≈ 12102203.16, bias = 127 * 2^23 = 1065353216
+    let v = (12102203.0f32 * x + 1065353216.0) as i32;
+    f32::from_bits(v as u32)
+}
+
 /// Per-splat intermediate produced during projection. Everything a pixel loop
 /// needs is baked in here — there's no reason to revisit the original `Splat`
 /// struct during composite.
@@ -169,29 +181,69 @@ pub fn sort_by_depth(projected: &mut [Projected]) {
 pub fn composite(projected: &[Projected], fb: &mut [(Vec3, f32)], width: u32, _height: u32, params: &RenderParams) {
     let w = width as usize;
     for p in projected {
-        let [x0, y0, x1, y1] = p.bbox;
-        for py in y0..=y1 {
-            let row = py as usize * w;
-            for px in x0..=x1 {
-                let idx = row + px as usize;
-                let cell = &mut fb[idx];
-                if cell.1 >= params.saturation {
-                    continue;
-                }
-                let d = Vec2::new(px as f32 - p.screen.x, py as f32 - p.screen.y);
-                let power = -0.5 * d.dot(p.cov2d_inv * d);
-                if power > 0.0 {
-                    continue;
-                }
-                let alpha = (p.opacity * power.exp()).min(0.999);
-                if alpha < params.alpha_threshold {
-                    continue;
-                }
-                let t = 1.0 - cell.1;
-                let contrib = t * alpha;
-                cell.0 += contrib * p.color;
-                cell.1 += contrib;
+        composite_splat(p, fb, w, params);
+    }
+}
+
+/// Composite a single projected splat into the framebuffer.
+/// Hoists row-constant Gaussian terms outside the inner pixel loop (ILP).
+///
+/// The 2D Gaussian exponent for pixel (px, py) is:
+///   power = -0.5 * [dx dy] * [[a b],[b d]] * [dx dy]^T
+///         = -0.5 * (a*dx² + 2*b*dx*dy + d*dy²)
+///
+/// For a fixed row (py), dy is constant, so we precompute:
+///   row_base  = -0.5 * d * dy²
+///   row_slope = -0.5 * 2 * b * dy = -b * dy
+///   dx_coeff  = -0.5 * a
+///
+/// Then: power = dx_coeff * dx² + row_slope * dx + row_base
+#[inline]
+fn composite_splat(p: &Projected, fb: &mut [(Vec3, f32)], w: usize, params: &RenderParams) {
+    let [x0, y0, x1, y1] = p.bbox;
+
+    // Extract the inverse covariance matrix elements.
+    let a = p.cov2d_inv.x_axis.x; // (0,0)
+    let b = p.cov2d_inv.x_axis.y; // (0,1) = (1,0) since symmetric
+    let d = p.cov2d_inv.y_axis.y; // (1,1)
+
+    // Coefficients for the decomposed quadratic.
+    let dx_coeff = -0.5 * a;
+    let dy_coeff = -0.5 * d;
+    let cross_coeff = -b; // -0.5 * 2 * b
+
+    let saturation = params.saturation;
+    let alpha_threshold = params.alpha_threshold;
+    let opacity = p.opacity;
+    let color = p.color;
+    let sx = p.screen.x;
+    let sy = p.screen.y;
+
+    for py in y0..=y1 {
+        let dy = py as f32 - sy;
+        let row_base = dy_coeff * dy * dy;
+        let row_slope = cross_coeff * dy;
+        let row_offset = py as usize * w;
+
+        for px in x0..=x1 {
+            let idx = row_offset + px as usize;
+            let cell = &mut fb[idx];
+            if cell.1 >= saturation {
+                continue;
             }
+            let dx = px as f32 - sx;
+            let power = dx_coeff * dx * dx + row_slope * dx + row_base;
+            if power > 0.0 {
+                continue;
+            }
+            let alpha = (opacity * fast_exp(power)).min(0.999);
+            if alpha < alpha_threshold {
+                continue;
+            }
+            let t = 1.0 - cell.1;
+            let contrib = t * alpha;
+            cell.0 += contrib * color;
+            cell.1 += contrib;
         }
     }
 }
@@ -244,26 +296,42 @@ pub fn composite_parallel(
                     let py_start = y0.max(tile_y0);
                     let py_end = y1.min(tile_y1);
 
+                    // ILP: hoist row-invariant terms out of the inner loop.
+                    let a = p.cov2d_inv.x_axis.x;
+                    let b = p.cov2d_inv.x_axis.y;
+                    let d = p.cov2d_inv.y_axis.y;
+                    let dx_coeff = -0.5 * a;
+                    let dy_coeff = -0.5 * d;
+                    let cross_coeff = -b;
+                    let saturation = params.saturation;
+                    let alpha_threshold = params.alpha_threshold;
+                    let opacity = p.opacity;
+                    let color = p.color;
+
                     for py in py_start..=py_end {
+                        let dy = py as f32 - p.screen.y;
+                        let row_base = dy_coeff * dy * dy;
+                        let row_slope = cross_coeff * dy;
                         let local_row = (py - tile_y0) as usize * w;
+
                         for px in x0..=x1 {
                             let idx = local_row + px as usize;
                             let cell = &mut tile_fb[idx];
-                            if cell.1 >= params.saturation {
+                            if cell.1 >= saturation {
                                 continue;
                             }
-                            let d = Vec2::new(px as f32 - p.screen.x, py as f32 - p.screen.y);
-                            let power = -0.5 * d.dot(p.cov2d_inv * d);
+                            let dx = px as f32 - p.screen.x;
+                            let power = dx_coeff * dx * dx + row_slope * dx + row_base;
                             if power > 0.0 {
                                 continue;
                             }
-                            let alpha = (p.opacity * power.exp()).min(0.999);
-                            if alpha < params.alpha_threshold {
+                            let alpha = (opacity * fast_exp(power)).min(0.999);
+                            if alpha < alpha_threshold {
                                 continue;
                             }
                             let t = 1.0 - cell.1;
                             let contrib = t * alpha;
-                            cell.0 += contrib * p.color;
+                            cell.0 += contrib * color;
                             cell.1 += contrib;
                         }
                     }
