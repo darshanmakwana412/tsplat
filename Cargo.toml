@@ -10,6 +10,13 @@ rayon = "1.10"
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"
 
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "forward_pass"
+harness = false
+
 [profile.release]
 lto = "thin"
 codegen-units = 1

@@ -31,3 +31,9 @@ target
 # Fetched 3DGS assets (see scripts/download-garden-ply.sh)
 /data/3dgs/*
 !/data/3dgs/.gitkeep
+
+# Regression test reference framebuffers (machine-specific)
+/tests/reference/
+
+# Criterion benchmark data
+/target/criterion/

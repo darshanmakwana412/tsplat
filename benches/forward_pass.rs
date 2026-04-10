@@ -1,0 +1,157 @@
+//! Criterion benchmarks for the 3DGS forward-pass pipeline stages.
+//!
+//! Uses the garden scene with fixed camera parameters captured from the HUD
+//! so that results are reproducible across runs.
+//!
+//! Run with: cargo bench --bench forward_pass
+
+use std::path::PathBuf;
+
+use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use glam::Vec3;
+
+use tsplat::camera::OrbitCamera;
+use tsplat::framebuffer::render_halfblocks;
+use tsplat::rasterize::{RenderParams, composite, project, sort_by_depth};
+use tsplat::splat::load_ply;
+
+/// Fixed terminal dimensions for benchmarking (120 cols x 40 rows = 120x80 pixel buffer).
+const BENCH_WIDTH: u32 = 120;
+const BENCH_HEIGHT: u32 = 80;
+
+/// Scene file path. Falls back to ~/datasets/3dgs/garden.ply if data/garden is missing.
+fn scene_path() -> PathBuf {
+    let local = PathBuf::from("data/garden/point_cloud.ply");
+    if local.exists() {
+        return local;
+    }
+    let home = PathBuf::from(std::env::var("HOME").unwrap_or_default())
+        .join("datasets/3dgs/garden.ply");
+    if home.exists() {
+        return home;
+    }
+    panic!(
+        "No garden scene found. Expected at data/garden/point_cloud.ply or ~/datasets/3dgs/garden.ply"
+    );
+}
+
+/// Set up the camera with the exact parameters from the HUD screenshot.
+fn bench_camera() -> OrbitCamera {
+    let mut cam = OrbitCamera::new(BENCH_WIDTH, BENCH_HEIGHT);
+    cam.yaw = -0.080;
+    cam.pitch = 0.353;
+    cam.radius = 52.161;
+    cam.fov_y = 55.0_f32.to_radians();
+    cam.target = Vec3::new(4.14, -11.97, -38.58);
+    cam
+}
+
+fn bench_project(c: &mut Criterion) {
+    let splats = load_ply(&scene_path(), true, 200_000).expect("failed to load scene");
+    let camera = bench_camera();
+    let params = RenderParams::default();
+
+    c.bench_function("project_200k", |b| {
+        b.iter(|| {
+            let projected = project(black_box(&splats), black_box(&camera), black_box(&params));
+            black_box(projected);
+        });
+    });
+}
+
+fn bench_sort(c: &mut Criterion) {
+    let splats = load_ply(&scene_path(), true, 200_000).expect("failed to load scene");
+    let camera = bench_camera();
+    let params = RenderParams::default();
+    let base_projected = project(&splats, &camera, &params);
+
+    c.bench_function("sort_by_depth_200k", |b| {
+        b.iter_batched(
+            || base_projected.clone(),
+            |mut projected| {
+                sort_by_depth(black_box(&mut projected));
+                black_box(projected);
+            },
+            criterion::BatchSize::LargeInput,
+        );
+    });
+}
+
+fn bench_composite(c: &mut Criterion) {
+    let splats = load_ply(&scene_path(), true, 200_000).expect("failed to load scene");
+    let camera = bench_camera();
+    let params = RenderParams::default();
+    let mut projected = project(&splats, &camera, &params);
+    sort_by_depth(&mut projected);
+
+    c.bench_function("composite_200k", |b| {
+        let mut fb = vec![(Vec3::ZERO, 0.0f32); (BENCH_WIDTH * BENCH_HEIGHT) as usize];
+        b.iter(|| {
+            for c in fb.iter_mut() {
+                *c = (Vec3::ZERO, 0.0);
+            }
+            composite(
+                black_box(&projected),
+                black_box(&mut fb),
+                BENCH_WIDTH,
+                BENCH_HEIGHT,
+                black_box(&params),
+            );
+            black_box(&fb);
+        });
+    });
+}
+
+fn bench_halfblocks(c: &mut Criterion) {
+    let splats = load_ply(&scene_path(), true, 200_000).expect("failed to load scene");
+    let camera = bench_camera();
+    let params = RenderParams::default();
+    let mut projected = project(&splats, &camera, &params);
+    sort_by_depth(&mut projected);
+    let mut fb = vec![(Vec3::ZERO, 0.0f32); (BENCH_WIDTH * BENCH_HEIGHT) as usize];
+    composite(&projected, &mut fb, BENCH_WIDTH, BENCH_HEIGHT, &params);
+
+    c.bench_function("render_halfblocks", |b| {
+        let mut out = String::with_capacity(256 * 1024);
+        b.iter(|| {
+            render_halfblocks(black_box(&fb), BENCH_WIDTH, BENCH_HEIGHT, black_box(&mut out));
+            black_box(&out);
+        });
+    });
+}
+
+fn bench_full_pipeline(c: &mut Criterion) {
+    let splats = load_ply(&scene_path(), true, 200_000).expect("failed to load scene");
+    let camera = bench_camera();
+    let params = RenderParams::default();
+
+    c.bench_function("full_pipeline_200k", |b| {
+        let mut fb = vec![(Vec3::ZERO, 0.0f32); (BENCH_WIDTH * BENCH_HEIGHT) as usize];
+        let mut out = String::with_capacity(256 * 1024);
+        b.iter(|| {
+            // Clear
+            for c in fb.iter_mut() {
+                *c = (Vec3::ZERO, 0.0);
+            }
+            // Project
+            let mut projected = project(&splats, &camera, &params);
+            // Sort
+            sort_by_depth(&mut projected);
+            // Composite
+            composite(&projected, &mut fb, BENCH_WIDTH, BENCH_HEIGHT, &params);
+            // Render
+            render_halfblocks(&fb, BENCH_WIDTH, BENCH_HEIGHT, &mut out);
+            black_box(&out);
+        });
+    });
+}
+
+criterion_group!(
+    benches,
+    bench_project,
+    bench_sort,
+    bench_composite,
+    bench_halfblocks,
+    bench_full_pipeline,
+);
+criterion_main!(benches);
