@@ -54,7 +54,14 @@ impl Default for RenderParams {
 }
 
 /// Project every splat. Parallel over splats (embarrassingly parallel).
-pub fn project(splats: &[Splat], camera: &OrbitCamera, params: &RenderParams) -> Vec<Projected> {
+/// Pass a pre-built thread pool to control parallelism, or None for rayon's
+/// global pool.
+pub fn project(
+    splats: &[Splat],
+    camera: &OrbitCamera,
+    params: &RenderParams,
+    pool: &Option<rayon::ThreadPool>,
+) -> Vec<Projected> {
     let view = camera.view();
     let w_mat = Mat3::from_mat4(view);
     let (fx, fy, cx, cy) = camera.intrinsics();
@@ -62,107 +69,122 @@ pub fn project(splats: &[Splat], camera: &OrbitCamera, params: &RenderParams) ->
     let h_i = camera.height as i32;
     let znear = camera.znear;
     let zfar = camera.zfar;
+    let w_mat_t = w_mat.transpose();
+    let eps2d = params.eps2d;
+    let extend_sigma = params.extend_sigma;
 
-    splats
-        .par_iter()
-        .filter_map(|s| {
-            // ---- View-transform center ----
-            // RH view: camera looks down -z, so a point in front has z < 0.
-            let p_view4 = view * Vec4::new(s.pos.x, s.pos.y, s.pos.z, 1.0);
-            let p_view = Vec3::new(p_view4.x, p_view4.y, p_view4.z);
-            if p_view.z > -znear || p_view.z < -zfar {
-                return None;
-            }
-            // Work with positive depth (zc > 0 means "in front").
-            let zc = -p_view.z;
-            let xv = p_view.x;
-            let yv = p_view.y;
+    let do_project = || {
+        splats
+            .par_iter()
+            .filter_map(|s| {
+                // ---- View-transform center ----
+                let p_view4 = view * Vec4::new(s.pos.x, s.pos.y, s.pos.z, 1.0);
+                let p_view = Vec3::new(p_view4.x, p_view4.y, p_view4.z);
+                if p_view.z > -znear || p_view.z < -zfar {
+                    return None;
+                }
+                let zc = -p_view.z;
+                let xv = p_view.x;
+                let yv = p_view.y;
 
-            // ---- 3D covariance: Σ = R S Sᵀ Rᵀ = (RS)(RS)ᵀ ----
-            let r_mat = Mat3::from_quat(s.rot);
-            let s_mat = Mat3::from_diagonal(s.scale);
-            let m = r_mat * s_mat;
-            let cov3d = m * m.transpose();
+                // ---- 3D covariance: Σ = R S Sᵀ Rᵀ = (RS)(RS)ᵀ ----
+                let r_mat = Mat3::from_quat(s.rot);
+                let s_mat = Mat3::from_diagonal(s.scale);
+                let m = r_mat * s_mat;
+                let cov3d = m * m.transpose();
 
-            // ---- Rotate covariance into view space ----
-            let cov3d_view = w_mat * cov3d * w_mat.transpose();
+                // ---- Rotate covariance into view space ----
+                let cov3d_view = w_mat * cov3d * w_mat_t;
 
-            // ---- Jacobian of pinhole projection at (xv, yv, zv) ----
-            // Projection (y-down framebuffer, RH view space with zc = -zv):
-            //   u = fx * xv / zc + cx
-            //   v = fy * yv / zc + cy
-            //
-            // ∂u/∂xv = fx/zc
-            // ∂u/∂zv = fx * xv / zc²
-            // ∂v/∂yv = fy/zc
-            // ∂v/∂zv = fy * yv / zc²
-            //
-            // Pad to 3x3 (third row zero) so glam's Mat3 multiplication works.
-            let zc2 = zc * zc;
-            let j = Mat3::from_cols(
-                Vec3::new(fx / zc, 0.0, 0.0),
-                Vec3::new(0.0, fy / zc, 0.0),
-                Vec3::new(fx * xv / zc2, fy * yv / zc2, 0.0),
-            );
+                // ---- Compute 2D covariance directly (ILP: exploit J's sparse structure) ----
+                // J has the form:
+                //   [fx/zc,   0,      fx*xv/zc²]
+                //   [0,       fy/zc,  fy*yv/zc²]
+                //   [0,       0,      0         ]
+                //
+                // We only need the top-left 2x2 of J * cov3d_view * J^T.
+                // Let C = cov3d_view, with elements c00..c22.
+                let c = &cov3d_view;
+                let inv_zc = 1.0 / zc;
+                let inv_zc2 = inv_zc * inv_zc;
 
-            let jcov = j * cov3d_view * j.transpose();
+                let j00 = fx * inv_zc;
+                let j02 = fx * xv * inv_zc2;
+                let j11 = fy * inv_zc;
+                let j12 = fy * yv * inv_zc2;
 
-            // Top-left 2x2 is the 2D image-plane covariance; the rest is 0
-            // because the third row of J was zero.
-            let mut cov2d = Mat2::from_cols(
-                Vec2::new(jcov.x_axis.x, jcov.x_axis.y),
-                Vec2::new(jcov.y_axis.x, jcov.y_axis.y),
-            );
-            // Low-pass dilation on the diagonal.
-            cov2d.x_axis.x += params.eps2d;
-            cov2d.y_axis.y += params.eps2d;
+                // Row 0 of J * C: [j00*c00 + j02*c20, j00*c01 + j02*c21, j00*c02 + j02*c22]
+                let t0x = j00 * c.x_axis.x + j02 * c.z_axis.x;
+                let t0y = j00 * c.y_axis.x + j02 * c.z_axis.y; // c01 = c.y_axis.x (column-major)
+                let t0z = j00 * c.x_axis.z + j02 * c.z_axis.z;
 
-            let det = cov2d.determinant();
-            if det <= 0.0 {
-                return None;
-            }
+                // Row 1 of J * C: [j11*c10 + j12*c20, j11*c11 + j12*c21, j11*c12 + j12*c22]
+                let t1y = j11 * c.y_axis.y + j12 * c.z_axis.y;
+                let t1z = j11 * c.y_axis.z + j12 * c.z_axis.z;
 
-            // Largest eigenvalue → 3σ bbox radius.
-            let a = cov2d.x_axis.x;
-            let d = cov2d.y_axis.y;
-            let b = 0.5 * (a + d);
-            let lambda1 = b + (b * b - det).max(0.01).sqrt();
-            let radius_f = params.extend_sigma * lambda1.sqrt();
-            if !radius_f.is_finite() || radius_f < 1.0 {
-                return None;
-            }
-            let radius = radius_f.ceil() as i32;
+                // 2D cov = (J*C) * J^T, top-left 2x2:
+                // cov2d[0][0] = row0 dot col0_of_J^T = t0x*j00 + t0z*j02
+                // cov2d[0][1] = row0 dot col1_of_J^T = t0y*j11 + t0z*j12  (= cov2d[1][0])
+                // cov2d[1][1] = row1 dot col1_of_J^T = t1y*j11 + t1z*j12 (note: t1x*0 = 0)
+                let cov2d_00 = t0x * j00 + t0z * j02 + eps2d;
+                let cov2d_01 = t0y * j11 + t0z * j12; // off-diagonal, no dilation
+                let cov2d_11 = t1y * j11 + t1z * j12 + eps2d;
 
-            let cov2d_inv = cov2d.inverse();
+                let det = cov2d_00 * cov2d_11 - cov2d_01 * cov2d_01;
+                if det <= 0.0 {
+                    return None;
+                }
 
-            // ---- Project center to pixel coords ----
-            let sx = fx * xv / zc + cx;
-            let sy = fy * yv / zc + cy;
+                // Largest eigenvalue → 3σ bbox radius.
+                let mid = 0.5 * (cov2d_00 + cov2d_11);
+                let lambda1 = mid + (mid * mid - det).max(0.01).sqrt();
+                let radius_f = extend_sigma * lambda1.sqrt();
+                if !radius_f.is_finite() || radius_f < 1.0 {
+                    return None;
+                }
+                let radius = radius_f.ceil() as i32;
 
-            let x0 = (sx - radius as f32).floor() as i32;
-            let y0 = (sy - radius as f32).floor() as i32;
-            let x1 = (sx + radius as f32).ceil() as i32;
-            let y1 = (sy + radius as f32).ceil() as i32;
+                // Invert 2x2 directly (avoid Mat2::inverse overhead).
+                let inv_det = 1.0 / det;
+                let cov2d_inv = Mat2::from_cols(
+                    Vec2::new(cov2d_11 * inv_det, -cov2d_01 * inv_det),
+                    Vec2::new(-cov2d_01 * inv_det, cov2d_00 * inv_det),
+                );
 
-            // Clip to framebuffer.
-            let x0 = x0.max(0);
-            let y0 = y0.max(0);
-            let x1 = x1.min(w_i - 1);
-            let y1 = y1.min(h_i - 1);
-            if x0 > x1 || y0 > y1 {
-                return None;
-            }
+                // ---- Project center to pixel coords ----
+                let sx = fx * xv * inv_zc + cx;
+                let sy = fy * yv * inv_zc + cy;
 
-            Some(Projected {
-                screen: Vec2::new(sx, sy),
-                depth: zc,
-                cov2d_inv,
-                bbox: [x0, y0, x1, y1],
-                color: s.color,
-                opacity: s.opacity,
+                let x0 = (sx - radius as f32).floor() as i32;
+                let y0 = (sy - radius as f32).floor() as i32;
+                let x1 = (sx + radius as f32).ceil() as i32;
+                let y1 = (sy + radius as f32).ceil() as i32;
+
+                // Clip to framebuffer.
+                let x0 = x0.max(0);
+                let y0 = y0.max(0);
+                let x1 = x1.min(w_i - 1);
+                let y1 = y1.min(h_i - 1);
+                if x0 > x1 || y0 > y1 {
+                    return None;
+                }
+
+                Some(Projected {
+                    screen: Vec2::new(sx, sy),
+                    depth: zc,
+                    cov2d_inv,
+                    bbox: [x0, y0, x1, y1],
+                    color: s.color,
+                    opacity: s.opacity,
+                })
             })
-        })
-        .collect()
+            .collect()
+    };
+
+    match pool.as_ref() {
+        Some(p) => p.install(do_project),
+        None => do_project(),
+    }
 }
 
 /// Sort front-to-back (smaller view-space depth = closer to camera).

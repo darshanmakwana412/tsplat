@@ -68,9 +68,10 @@ fn run_pipeline() -> (Vec<(Vec3, f32)>, String) {
     let splats = load_ply(&scene_path(), true, MAX_SPLATS).expect("failed to load scene");
     let camera = bench_camera();
     let params = RenderParams::default();
+    let pool = None; // use rayon global pool for tests
 
     let mut fb = vec![(Vec3::ZERO, 0.0f32); (WIDTH * HEIGHT) as usize];
-    let mut projected = project(&splats, &camera, &params);
+    let mut projected = project(&splats, &camera, &params, &pool);
     sort_by_depth(&mut projected);
     composite(&projected, &mut fb, WIDTH, HEIGHT, &params);
 

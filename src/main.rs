@@ -228,7 +228,7 @@ fn main() -> Result<()> {
         }
 
         let render_params = &hud.render_params;
-        let mut projected = project(&splats, &camera, render_params);
+        let mut projected = project(&splats, &camera, render_params, &thread_pool);
         sort_by_depth(&mut projected);
         composite_parallel(&projected, &mut fb, width, height, render_params, &thread_pool);
         framebuffer::render_halfblocks(&fb, width, height, &mut out);

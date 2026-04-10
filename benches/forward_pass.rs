@@ -50,10 +50,11 @@ fn bench_project(c: &mut Criterion) {
     let splats = load_ply(&scene_path(), true, 200_000).expect("failed to load scene");
     let camera = bench_camera();
     let params = RenderParams::default();
+    let pool = None;
 
     c.bench_function("project_200k", |b| {
         b.iter(|| {
-            let projected = project(black_box(&splats), black_box(&camera), black_box(&params));
+            let projected = project(black_box(&splats), black_box(&camera), black_box(&params), black_box(&pool));
             black_box(projected);
         });
     });
@@ -63,7 +64,8 @@ fn bench_sort(c: &mut Criterion) {
     let splats = load_ply(&scene_path(), true, 200_000).expect("failed to load scene");
     let camera = bench_camera();
     let params = RenderParams::default();
-    let base_projected = project(&splats, &camera, &params);
+    let pool = None;
+    let base_projected = project(&splats, &camera, &params, &pool);
 
     c.bench_function("sort_by_depth_200k", |b| {
         b.iter_batched(
@@ -81,7 +83,8 @@ fn bench_composite(c: &mut Criterion) {
     let splats = load_ply(&scene_path(), true, 200_000).expect("failed to load scene");
     let camera = bench_camera();
     let params = RenderParams::default();
-    let mut projected = project(&splats, &camera, &params);
+    let pool = None;
+    let mut projected = project(&splats, &camera, &params, &pool);
     sort_by_depth(&mut projected);
 
     c.bench_function("composite_200k", |b| {
@@ -106,7 +109,8 @@ fn bench_halfblocks(c: &mut Criterion) {
     let splats = load_ply(&scene_path(), true, 200_000).expect("failed to load scene");
     let camera = bench_camera();
     let params = RenderParams::default();
-    let mut projected = project(&splats, &camera, &params);
+    let pool = None;
+    let mut projected = project(&splats, &camera, &params, &pool);
     sort_by_depth(&mut projected);
     let mut fb = vec![(Vec3::ZERO, 0.0f32); (BENCH_WIDTH * BENCH_HEIGHT) as usize];
     composite(&projected, &mut fb, BENCH_WIDTH, BENCH_HEIGHT, &params);
@@ -124,6 +128,7 @@ fn bench_full_pipeline(c: &mut Criterion) {
     let splats = load_ply(&scene_path(), true, 200_000).expect("failed to load scene");
     let camera = bench_camera();
     let params = RenderParams::default();
+    let pool = None;
 
     c.bench_function("full_pipeline_200k", |b| {
         let mut fb = vec![(Vec3::ZERO, 0.0f32); (BENCH_WIDTH * BENCH_HEIGHT) as usize];
@@ -134,7 +139,7 @@ fn bench_full_pipeline(c: &mut Criterion) {
                 *c = (Vec3::ZERO, 0.0);
             }
             // Project
-            let mut projected = project(&splats, &camera, &params);
+            let mut projected = project(&splats, &camera, &params, &pool);
             // Sort
             sort_by_depth(&mut projected);
             // Composite

@@ -163,7 +163,7 @@ fn main() {
     for _ in 0..args.warmup {
         // Fast zero-fill via memset.
         unsafe { std::ptr::write_bytes(fb.as_mut_ptr(), 0, fb.len()); }
-        let mut projected = project(&splats, &camera, &params);
+        let mut projected = project(&splats, &camera, &params, &pool);
         sort_by_depth(&mut projected);
         composite_parallel(&projected, &mut fb, args.width, args.height, &params, &pool);
         render_halfblocks(&fb, args.width, args.height, &mut out);
@@ -182,7 +182,7 @@ fn main() {
 
         // Project
         let t0 = Instant::now();
-        let mut projected = project(&splats, &camera, &params);
+        let mut projected = project(&splats, &camera, &params, &pool);
         let t1 = Instant::now();
 
         // Sort
