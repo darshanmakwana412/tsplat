@@ -21,6 +21,7 @@ pub enum HudAction {
 enum HudItem {
     MaxSplats,
     Sigmoid,
+    NumThreads,
     FovY,
     YawStep,
     PitchStep,
@@ -42,6 +43,7 @@ struct Entry {
 const ITEMS: &[Entry] = &[
     Entry { group: Some("Splats"),  item: HudItem::MaxSplats,       label: "max_splats" },
     Entry { group: None,            item: HudItem::Sigmoid,         label: "sigmoid" },
+    Entry { group: Some("Perf"),    item: HudItem::NumThreads,      label: "threads" },
     Entry { group: Some("Camera"),  item: HudItem::FovY,            label: "fov_y" },
     Entry { group: None,            item: HudItem::YawStep,         label: "orbit spd" },
     Entry { group: None,            item: HudItem::PitchStep,       label: "pitch spd" },
@@ -63,6 +65,10 @@ pub struct HudState {
     pub max_splats: usize,
     pub apply_sigmoid: bool,
 
+    // -- Performance parameters (real-time) --
+    /// Number of threads for parallel composite. 0 = use all (rayon default).
+    pub num_threads: usize,
+
     // -- Camera parameters (real-time) --
     pub fov_y_deg: f32,
     pub yaw_step: f32,
@@ -80,6 +86,7 @@ impl HudState {
             cursor: 0,
             max_splats,
             apply_sigmoid,
+            num_threads: 4,
             fov_y_deg: fov_y_rad.to_degrees(),
             yaw_step: 0.08,
             pitch_step: 0.06,
@@ -128,6 +135,17 @@ impl HudState {
             HudItem::Sigmoid => {
                 self.apply_sigmoid = !self.apply_sigmoid;
                 HudAction::ReloadSplats
+            }
+            HudItem::NumThreads => {
+                let max_cpus = std::thread::available_parallelism()
+                    .map(|n| n.get())
+                    .unwrap_or(16);
+                if dir > 0 {
+                    self.num_threads = (self.num_threads + 1).min(max_cpus);
+                } else {
+                    self.num_threads = self.num_threads.saturating_sub(1); // 0 = all
+                }
+                HudAction::ValueChanged
             }
             HudItem::FovY => {
                 self.fov_y_deg = (self.fov_y_deg + dir as f32 * 5.0).clamp(10.0, 150.0);
@@ -182,6 +200,9 @@ impl HudState {
             }
             HudItem::Sigmoid => {
                 if self.apply_sigmoid { "ON".into() } else { "OFF".into() }
+            }
+            HudItem::NumThreads => {
+                if self.num_threads == 0 { "all".into() } else { self.num_threads.to_string() }
             }
             HudItem::FovY => format!("{:.0}", self.fov_y_deg),
             HudItem::YawStep => format!("{:.2}", self.yaw_step),

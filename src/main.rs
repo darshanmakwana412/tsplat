@@ -20,7 +20,7 @@ mod splat;
 
 use camera::OrbitCamera;
 use hud::{HudAction, HudState};
-use rasterize::{composite, project, sort_by_depth};
+use rasterize::{composite_parallel, project, sort_by_depth};
 use splat::{Splat, load_ply};
 
 #[derive(ClapParser, Debug)]
@@ -220,7 +220,7 @@ fn main() -> Result<()> {
         let render_params = &hud.render_params;
         let mut projected = project(&splats, &camera, render_params);
         sort_by_depth(&mut projected);
-        composite(&projected, &mut fb, width, height, render_params);
+        composite_parallel(&projected, &mut fb, width, height, render_params, hud.num_threads);
         framebuffer::render_halfblocks(&fb, width, height, &mut out);
 
         // ---- FPS overlay ----

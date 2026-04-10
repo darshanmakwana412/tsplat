@@ -15,7 +15,7 @@ use glam::Vec3;
 
 use tsplat::camera::OrbitCamera;
 use tsplat::framebuffer::render_halfblocks;
-use tsplat::rasterize::{RenderParams, composite, project, sort_by_depth};
+use tsplat::rasterize::{RenderParams, composite_parallel, project, sort_by_depth};
 use tsplat::splat::load_ply;
 
 fn scene_path() -> PathBuf {
@@ -165,7 +165,7 @@ fn main() {
         }
         let mut projected = project(&splats, &camera, &params);
         sort_by_depth(&mut projected);
-        composite(&projected, &mut fb, args.width, args.height, &params);
+        composite_parallel(&projected, &mut fb, args.width, args.height, &params, 4);
         render_halfblocks(&fb, args.width, args.height, &mut out);
     }
 
@@ -193,7 +193,7 @@ fn main() {
 
         // Composite
         let t4 = Instant::now();
-        composite(&projected, &mut fb, args.width, args.height, &params);
+        composite_parallel(&projected, &mut fb, args.width, args.height, &params, 4);
         let t5 = Instant::now();
 
         // Halfblocks

@@ -163,7 +163,7 @@ pub fn sort_by_depth(projected: &mut [Projected]) {
     });
 }
 
-/// Front-to-back alpha composite into the RGB framebuffer.
+/// Front-to-back alpha composite into the RGB framebuffer (single-threaded).
 ///
 /// `fb` is a packed `(rgb, accum_alpha)` buffer of length `width * height`,
 /// assumed to be zeroed at the start of each frame.
@@ -194,5 +194,86 @@ pub fn composite(projected: &[Projected], fb: &mut [(Vec3, f32)], width: u32, _h
                 cell.1 += contrib;
             }
         }
+    }
+}
+
+/// Height in pixels of each horizontal tile for parallel composite.
+const TILE_HEIGHT: usize = 16;
+
+/// Front-to-back alpha composite into the RGB framebuffer, parallelised over
+/// horizontal tiles. Each tile owns a disjoint slice of the framebuffer so
+/// there are no data races. `num_threads` controls the rayon thread pool size
+/// (0 means use rayon's default, which is all logical cores).
+pub fn composite_parallel(
+    projected: &[Projected],
+    fb: &mut [(Vec3, f32)],
+    width: u32,
+    height: u32,
+    params: &RenderParams,
+    num_threads: usize,
+) {
+    let w = width as usize;
+    let h = height as usize;
+    // Build a custom thread pool if num_threads > 0, otherwise use global pool.
+    let pool = if num_threads > 0 {
+        Some(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(num_threads)
+                .build()
+                .expect("failed to build rayon thread pool"),
+        )
+    } else {
+        None
+    };
+
+    let do_composite = |fb: &mut [(Vec3, f32)]| {
+        // Split fb into tile-sized chunks and process in parallel.
+        let tile_stride = TILE_HEIGHT * w;
+        fb.par_chunks_mut(tile_stride)
+            .enumerate()
+            .for_each(|(tile_idx, tile_fb)| {
+                let tile_y0 = (tile_idx * TILE_HEIGHT) as i32;
+                let tile_y1 = (tile_y0 + tile_fb.len() as i32 / w as i32 - 1).min(h as i32 - 1);
+
+                for p in projected {
+                    let [x0, y0, x1, y1] = p.bbox;
+                    // Skip splats that don't overlap this tile.
+                    if y1 < tile_y0 || y0 > tile_y1 {
+                        continue;
+                    }
+                    // Clamp to tile bounds.
+                    let py_start = y0.max(tile_y0);
+                    let py_end = y1.min(tile_y1);
+
+                    for py in py_start..=py_end {
+                        let local_row = (py - tile_y0) as usize * w;
+                        for px in x0..=x1 {
+                            let idx = local_row + px as usize;
+                            let cell = &mut tile_fb[idx];
+                            if cell.1 >= params.saturation {
+                                continue;
+                            }
+                            let d = Vec2::new(px as f32 - p.screen.x, py as f32 - p.screen.y);
+                            let power = -0.5 * d.dot(p.cov2d_inv * d);
+                            if power > 0.0 {
+                                continue;
+                            }
+                            let alpha = (p.opacity * power.exp()).min(0.999);
+                            if alpha < params.alpha_threshold {
+                                continue;
+                            }
+                            let t = 1.0 - cell.1;
+                            let contrib = t * alpha;
+                            cell.0 += contrib * p.color;
+                            cell.1 += contrib;
+                        }
+                    }
+                }
+            });
+    };
+
+    match pool {
+        Some(ref p) => p.install(|| do_composite(fb)),
+        None => do_composite(fb),
     }
 }
