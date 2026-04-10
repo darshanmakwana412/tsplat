@@ -12,6 +12,7 @@ use crossterm::{
 use glam::Vec3;
 
 mod camera;
+mod display;
 mod framebuffer;
 mod hud;
 mod rasterize;
@@ -19,7 +20,8 @@ mod sh;
 mod splat;
 
 use camera::OrbitCamera;
-use hud::{HudAction, HudState};
+use display::Display;
+use hud::{DisplayInfo, HudAction, HudState};
 use rasterize::{ScratchBuffers, build_thread_pool, composite_parallel, project, sort_by_depth};
 use splat::{Splat, load_ply};
 
@@ -105,23 +107,29 @@ fn main() -> Result<()> {
     let _guard = TerminalGuard::new()?;
 
     let (cols, rows) = terminal::size()?;
-    let mut width = cols as u32;
-    let mut height = rows as u32 * 2;
+    let cols = cols as u32;
+    let rows = rows as u32;
+
+    // Detect backend and cell pixel size (must happen in raw mode).
+    let mut display = Display::new(cols, rows);
+
+    // Get initial framebuffer dimensions from the display backend.
+    let (mut width, mut height) = display.framebuffer_size();
 
     let mut camera = OrbitCamera::new(width, height);
     let (center, radius) = scene_bounds(&splats);
     camera.target = center;
     camera.radius = radius * 2.5;
 
-    let mut hud = HudState::new(cap, !args.raw_opacity, camera.fov_y);
+    let mut hud = HudState::new(cap, !args.raw_opacity, camera.fov_y, &display);
 
     let mut fb: Vec<(Vec3, f32)> = vec![(Vec3::ZERO, 0.0); (width * height) as usize];
-    let mut out = String::with_capacity(256 * 1024);
 
     let mut frames_since_report = 0u32;
     let mut last_fps_report = Instant::now();
     let mut fps = 0.0_f32;
     let mut needs_reload = false;
+    let mut needs_fb_resize = false;
     let mut thread_pool = build_thread_pool(hud.num_threads);
     let mut last_num_threads = hud.num_threads;
     let mut scratch = ScratchBuffers::new();
@@ -131,15 +139,20 @@ fn main() -> Result<()> {
         while event::poll(Duration::from_millis(0))? {
             match event::read()? {
                 Event::Key(k) => match k.code {
-                    KeyCode::Char('q') => return Ok(()),
+                    KeyCode::Char('q') => {
+                        display.kitty_cleanup();
+                        return Ok(());
+                    }
                     KeyCode::Esc => {
                         if hud.visible {
                             hud.toggle();
                         } else {
+                            display.kitty_cleanup();
                             return Ok(());
                         }
                     }
                     KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => {
+                        display.kitty_cleanup();
                         return Ok(());
                     }
                     KeyCode::Tab => hud.toggle(),
@@ -150,7 +163,7 @@ fn main() -> Result<()> {
                     KeyCode::Char('j') => camera.orbit(0.0, -hud.pitch_step),
                     KeyCode::Char('+') | KeyCode::Char('=') => camera.zoom(1.0 - hud.zoom_step),
                     KeyCode::Char('-') | KeyCode::Char('_') => camera.zoom(1.0 + hud.zoom_step),
-                    // WASD: spatial pan (proportional to current radius)
+                    // WASD: spatial pan
                     KeyCode::Char('w') | KeyCode::Char('W') => {
                         let step = camera.radius * 0.05;
                         camera.pan(0.0, step);
@@ -176,6 +189,15 @@ fn main() -> Result<()> {
                                 HudAction::ValueChanged => {
                                     camera.fov_y = hud.fov_y_deg.to_radians();
                                 }
+                                HudAction::BackendChanged => {
+                                    display.backend = hud.backend;
+                                    display.kitty_cleanup();
+                                    needs_fb_resize = true;
+                                }
+                                HudAction::DensityChanged => {
+                                    display.pixel_density = hud.pixel_density;
+                                    needs_fb_resize = true;
+                                }
                                 HudAction::None => {}
                             }
                         } else {
@@ -191,10 +213,8 @@ fn main() -> Result<()> {
                     _ => {}
                 },
                 Event::Resize(new_cols, new_rows) => {
-                    width = new_cols as u32;
-                    height = new_rows as u32 * 2;
-                    camera.resize(width, height);
-                    fb = vec![(Vec3::ZERO, 0.0); (width * height) as usize];
+                    display.resize(new_cols as u32, new_rows as u32);
+                    needs_fb_resize = true;
                 }
                 Event::Mouse(me) => match me.kind {
                     MouseEventKind::ScrollUp => camera.zoom(1.0 - hud.zoom_step),
@@ -203,6 +223,16 @@ fn main() -> Result<()> {
                 },
                 _ => {}
             }
+        }
+
+        // ---- resize framebuffer if backend/density/terminal changed ----
+        if needs_fb_resize {
+            let (new_w, new_h) = display.framebuffer_size();
+            width = new_w;
+            height = new_h;
+            camera.resize(width, height);
+            fb = vec![(Vec3::ZERO, 0.0); (width * height) as usize];
+            needs_fb_resize = false;
         }
 
         // ---- reload splats if requested ----
@@ -217,8 +247,7 @@ fn main() -> Result<()> {
         }
 
         // ---- render ----
-        // Fast zero-fill: (Vec3::ZERO, 0.0) is all-zeros in memory.
-        // SAFETY: (Vec3, f32) is repr(C)-compatible, all-zero bits is valid.
+        // Fast zero-fill.
         unsafe {
             std::ptr::write_bytes(fb.as_mut_ptr(), 0, fb.len());
         }
@@ -232,9 +261,11 @@ fn main() -> Result<()> {
         let mut projected = project(&splats, &camera, render_params, &thread_pool);
         sort_by_depth(&mut projected, &mut scratch);
         composite_parallel(&projected, &mut fb, width, height, render_params, &thread_pool);
-        framebuffer::render_halfblocks(&fb, width, height, &mut out);
 
-        // ---- FPS overlay ----
+        // Convert framebuffer to terminal output.
+        display.render(&fb, width, height);
+
+        // ---- FPS overlay (cursor-addressed ANSI, works on both backends) ----
         frames_since_report += 1;
         let now = Instant::now();
         let elapsed = now.duration_since(last_fps_report).as_secs_f32();
@@ -244,19 +275,21 @@ fn main() -> Result<()> {
             last_fps_report = now;
         }
         let fps_str = format!(" FPS {:5.1} ", fps);
-        let col = (width as usize)
+        let col = (display.cols as usize)
             .saturating_sub(fps_str.chars().count())
             .max(0)
-            + 1; // 1-indexed
-        use std::fmt::Write as _;
-        let _ = write!(out, "\x1b[1;{}H\x1b[97;40m{}\x1b[0m", col, fps_str);
+            + 1;
+        {
+            let di = DisplayInfo::from_display(&display);
+            let out = display.overlay_string();
+            use std::fmt::Write as _;
+            let _ = write!(out, "\x1b[1;{}H\x1b[97;40m{}\x1b[0m", col, fps_str);
 
-        // ---- HUD overlay ----
-        hud.render(&camera, &mut out);
+            // ---- HUD overlay ----
+            hud.render(&camera, &di, out);
+        }
 
         // ---- single flush ----
-        let mut so = stdout().lock();
-        so.write_all(out.as_bytes())?;
-        so.flush()?;
+        display.flush()?;
     }
 }

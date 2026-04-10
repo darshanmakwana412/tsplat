@@ -3,7 +3,32 @@ use std::fmt::Write;
 use crossterm::event::KeyCode;
 
 use crate::camera::OrbitCamera;
+use crate::display::{Backend, CellSize, Display};
 use crate::rasterize::RenderParams;
+
+/// Snapshot of Display state needed for HUD rendering (avoids borrow conflicts).
+pub struct DisplayInfo {
+    pub fb_w: u32,
+    pub fb_h: u32,
+    pub cell_size: CellSize,
+    pub cols: u32,
+    pub rows: u32,
+    pub detected_backend: Backend,
+}
+
+impl DisplayInfo {
+    pub fn from_display(d: &Display) -> Self {
+        let (fb_w, fb_h) = d.framebuffer_size();
+        Self {
+            fb_w,
+            fb_h,
+            cell_size: d.cell_size,
+            cols: d.cols,
+            rows: d.rows,
+            detected_backend: d.detected_backend,
+        }
+    }
+}
 
 /// What happened after the HUD processed a key.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -14,6 +39,10 @@ pub enum HudAction {
     ValueChanged,
     /// A parameter that requires a PLY reload changed (max_splats or sigmoid).
     ReloadSplats,
+    /// The rendering backend was switched.
+    BackendChanged,
+    /// Pixel density changed (needs framebuffer resize).
+    DensityChanged,
 }
 
 /// Identity of each tunable item in the HUD.
@@ -22,6 +51,8 @@ enum HudItem {
     MaxSplats,
     Sigmoid,
     NumThreads,
+    RenderBackend,
+    PixelDensity,
     FovY,
     YawStep,
     PitchStep,
@@ -32,8 +63,7 @@ enum HudItem {
     Saturation,
 }
 
-/// An entry in the flat display list. `group` is `Some("header")` for the
-/// first item in a group (renders a header row above it), `None` otherwise.
+/// An entry in the flat display list.
 struct Entry {
     group: Option<&'static str>,
     item: HudItem,
@@ -41,17 +71,19 @@ struct Entry {
 }
 
 const ITEMS: &[Entry] = &[
-    Entry { group: Some("Splats"),  item: HudItem::MaxSplats,       label: "max_splats" },
-    Entry { group: None,            item: HudItem::Sigmoid,         label: "sigmoid" },
-    Entry { group: Some("Perf"),    item: HudItem::NumThreads,      label: "threads" },
-    Entry { group: Some("Camera"),  item: HudItem::FovY,            label: "fov_y" },
-    Entry { group: None,            item: HudItem::YawStep,         label: "orbit spd" },
-    Entry { group: None,            item: HudItem::PitchStep,       label: "pitch spd" },
-    Entry { group: None,            item: HudItem::ZoomStep,        label: "zoom spd" },
-    Entry { group: Some("Render"),  item: HudItem::Eps2d,           label: "eps2d" },
-    Entry { group: None,            item: HudItem::AlphaThreshold,  label: "alpha thr" },
-    Entry { group: None,            item: HudItem::ExtendSigma,     label: "sigma ext" },
-    Entry { group: None,            item: HudItem::Saturation,      label: "saturation" },
+    Entry { group: Some("Splats"),   item: HudItem::MaxSplats,       label: "max_splats" },
+    Entry { group: None,             item: HudItem::Sigmoid,         label: "sigmoid" },
+    Entry { group: Some("Display"),  item: HudItem::RenderBackend,   label: "backend" },
+    Entry { group: None,             item: HudItem::PixelDensity,    label: "px density" },
+    Entry { group: Some("Perf"),     item: HudItem::NumThreads,      label: "threads" },
+    Entry { group: Some("Camera"),   item: HudItem::FovY,            label: "fov_y" },
+    Entry { group: None,             item: HudItem::YawStep,         label: "orbit spd" },
+    Entry { group: None,             item: HudItem::PitchStep,       label: "pitch spd" },
+    Entry { group: None,             item: HudItem::ZoomStep,        label: "zoom spd" },
+    Entry { group: Some("Render"),   item: HudItem::Eps2d,           label: "eps2d" },
+    Entry { group: None,             item: HudItem::AlphaThreshold,  label: "alpha thr" },
+    Entry { group: None,             item: HudItem::ExtendSigma,     label: "sigma ext" },
+    Entry { group: None,             item: HudItem::Saturation,      label: "saturation" },
 ];
 
 /// Width of the HUD panel in characters.
@@ -66,8 +98,12 @@ pub struct HudState {
     pub apply_sigmoid: bool,
 
     // -- Performance parameters (real-time) --
-    /// Number of threads for parallel composite. 0 = use all (rayon default).
     pub num_threads: usize,
+
+    // -- Display parameters --
+    pub backend: Backend,
+    pub detected_backend: Backend,
+    pub pixel_density: f32,
 
     // -- Camera parameters (real-time) --
     pub fov_y_deg: f32,
@@ -80,13 +116,16 @@ pub struct HudState {
 }
 
 impl HudState {
-    pub fn new(max_splats: usize, apply_sigmoid: bool, fov_y_rad: f32) -> Self {
+    pub fn new(max_splats: usize, apply_sigmoid: bool, fov_y_rad: f32, display: &Display) -> Self {
         Self {
             visible: false,
             cursor: 0,
             max_splats,
             apply_sigmoid,
             num_threads: 4,
+            backend: display.backend,
+            detected_backend: display.detected_backend,
+            pixel_density: display.pixel_density,
             fov_y_deg: fov_y_rad.to_degrees(),
             yaw_step: 0.08,
             pitch_step: 0.06,
@@ -100,7 +139,6 @@ impl HudState {
     }
 
     /// Process an arrow key while the HUD is visible.
-    /// Returns what kind of change happened (if any).
     pub fn handle_key(&mut self, code: KeyCode) -> HudAction {
         match code {
             KeyCode::Up => {
@@ -143,9 +181,30 @@ impl HudState {
                 if dir > 0 {
                     self.num_threads = (self.num_threads + 1).min(max_cpus);
                 } else {
-                    self.num_threads = self.num_threads.saturating_sub(1); // 0 = all
+                    self.num_threads = self.num_threads.saturating_sub(1);
                 }
                 HudAction::ValueChanged
+            }
+            HudItem::RenderBackend => {
+                // Toggle between available backends.
+                self.backend = match self.backend {
+                    Backend::HalfBlock => {
+                        if self.detected_backend == Backend::Kitty {
+                            Backend::Kitty
+                        } else {
+                            Backend::HalfBlock // can't switch if not supported
+                        }
+                    }
+                    Backend::Kitty => Backend::HalfBlock,
+                };
+                HudAction::BackendChanged
+            }
+            HudItem::PixelDensity => {
+                // Step by 0.05 between 0.10 and 1.0.
+                self.pixel_density = (self.pixel_density + dir as f32 * 0.05).clamp(0.10, 1.0);
+                // Round to avoid float drift.
+                self.pixel_density = (self.pixel_density * 20.0).round() / 20.0;
+                HudAction::DensityChanged
             }
             HudItem::FovY => {
                 self.fov_y_deg = (self.fov_y_deg + dir as f32 * 5.0).clamp(10.0, 150.0);
@@ -204,6 +263,21 @@ impl HudState {
             HudItem::NumThreads => {
                 if self.num_threads == 0 { "all".into() } else { self.num_threads.to_string() }
             }
+            HudItem::RenderBackend => {
+                let name = self.backend.name();
+                if self.detected_backend == Backend::Kitty {
+                    name.to_string()
+                } else {
+                    format!("{} (only)", name)
+                }
+            }
+            HudItem::PixelDensity => {
+                if self.backend == Backend::Kitty {
+                    format!("{:.0}%", self.pixel_density * 100.0)
+                } else {
+                    "n/a".into()
+                }
+            }
             HudItem::FovY => format!("{:.0}", self.fov_y_deg),
             HudItem::YawStep => format!("{:.2}", self.yaw_step),
             HudItem::PitchStep => format!("{:.2}", self.pitch_step),
@@ -216,19 +290,18 @@ impl HudState {
     }
 
     /// Append cursor-addressed ANSI escape lines to `out`.
-    pub fn render(&self, camera: &OrbitCamera, out: &mut String) {
+    pub fn render(&self, camera: &OrbitCamera, di: &DisplayInfo, out: &mut String) {
         if !self.visible {
             return;
         }
 
-        let mut row: usize = 1; // 1-indexed terminal rows
+        let mut row: usize = 1;
 
         // Title
         write_hud_line(out, row, "\x1b[1;97;40m", " [HUD] Tab to close");
         row += 1;
 
         for (i, entry) in ITEMS.iter().enumerate() {
-            // Group header
             if let Some(group) = entry.group {
                 let header = format!(" -- {} ", group);
                 let padded = format!("{:-<width$}", header, width = HUD_WIDTH);
@@ -236,16 +309,32 @@ impl HudState {
                 row += 1;
             }
 
-            // Item row
             let value = self.format_value(entry.item);
             let marker = if i == self.cursor { ">" } else { " " };
             let content = format!(" {} {:<12} {:>8}", marker, entry.label, value);
             let sgr = if i == self.cursor {
-                "\x1b[30;107m" // black on bright white (selected)
+                "\x1b[30;107m"
             } else {
-                "\x1b[97;40m" // white on black
+                "\x1b[97;40m"
             };
             write_hud_line(out, row, sgr, &content);
+            row += 1;
+        }
+
+        // Display info (read-only)
+        let header = format!("{:-<width$}", " -- Display Info ", width = HUD_WIDTH);
+        write_hud_line(out, row, "\x1b[90;40m", &header);
+        row += 1;
+
+        let info_rows: &[(&str, String)] = &[
+            ("resolution", format!("{} x {}", di.fb_w, di.fb_h)),
+            ("cell size",  format!("{} x {} px", di.cell_size.w, di.cell_size.h)),
+            ("terminal",   format!("{} x {} cells", di.cols, di.rows)),
+            ("detected",   di.detected_backend.name().to_string()),
+        ];
+        for (label, value) in info_rows {
+            let content = format!("   {:<12} {:>8}", label, value);
+            write_hud_line(out, row, "\x1b[97;40m", &content);
             row += 1;
         }
 
@@ -255,7 +344,7 @@ impl HudState {
         row += 1;
 
         let pos = camera.position();
-        let rows: &[(&str, String)] = &[
+        let cam_rows: &[(&str, String)] = &[
             ("yaw",    format!("{:>+8.3} rad", camera.yaw)),
             ("pitch",  format!("{:>+8.3} rad", camera.pitch)),
             ("radius", format!("{:>8.3}", camera.radius)),
@@ -267,7 +356,7 @@ impl HudState {
             ("tgt y",  format!("{:>+8.2}", camera.target.y)),
             ("tgt z",  format!("{:>+8.2}", camera.target.z)),
         ];
-        for (label, value) in rows {
+        for (label, value) in cam_rows {
             let content = format!("   {:<12} {:>8}", label, value);
             write_hud_line(out, row, "\x1b[97;40m", &content);
             row += 1;
@@ -277,7 +366,6 @@ impl HudState {
 
 /// Write a single HUD line at the given terminal row, padded to `HUD_WIDTH`.
 fn write_hud_line(out: &mut String, row: usize, sgr: &str, text: &str) {
-    // Truncate or pad to fixed width
     let display: String = if text.len() >= HUD_WIDTH {
         text[..HUD_WIDTH].to_string()
     } else {
