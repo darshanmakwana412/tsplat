@@ -6,7 +6,7 @@ use anyhow::Result;
 use clap::Parser as ClapParser;
 use crossterm::{
     cursor,
-    event::{self, Event, KeyCode, KeyModifiers},
+    event::{self, EnableMouseCapture, DisableMouseCapture, Event, KeyCode, KeyModifiers, MouseEventKind},
     execute, terminal,
 };
 use glam::Vec3;
@@ -58,14 +58,14 @@ struct TerminalGuard;
 impl TerminalGuard {
     fn new() -> Result<Self> {
         terminal::enable_raw_mode()?;
-        execute!(stdout(), terminal::EnterAlternateScreen, cursor::Hide)?;
+        execute!(stdout(), terminal::EnterAlternateScreen, cursor::Hide, EnableMouseCapture)?;
         Ok(Self)
     }
 }
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
-        let _ = execute!(stdout(), cursor::Show, terminal::LeaveAlternateScreen);
+        let _ = execute!(stdout(), DisableMouseCapture, cursor::Show, terminal::LeaveAlternateScreen);
         let _ = terminal::disable_raw_mode();
     }
 }
@@ -147,6 +147,23 @@ fn main() -> Result<()> {
                     KeyCode::Char('j') => camera.orbit(0.0, -hud.pitch_step),
                     KeyCode::Char('+') | KeyCode::Char('=') => camera.zoom(1.0 - hud.zoom_step),
                     KeyCode::Char('-') | KeyCode::Char('_') => camera.zoom(1.0 + hud.zoom_step),
+                    // WASD: spatial pan (proportional to current radius)
+                    KeyCode::Char('w') | KeyCode::Char('W') => {
+                        let step = camera.radius * 0.05;
+                        camera.pan(0.0, step);
+                    }
+                    KeyCode::Char('s') | KeyCode::Char('S') => {
+                        let step = camera.radius * 0.05;
+                        camera.pan(0.0, -step);
+                    }
+                    KeyCode::Char('a') | KeyCode::Char('A') => {
+                        let step = camera.radius * 0.05;
+                        camera.pan(-step, 0.0);
+                    }
+                    KeyCode::Char('d') | KeyCode::Char('D') => {
+                        let step = camera.radius * 0.05;
+                        camera.pan(step, 0.0);
+                    }
                     // Arrow keys: HUD when visible, camera when hidden
                     KeyCode::Up | KeyCode::Down | KeyCode::Left | KeyCode::Right => {
                         if hud.visible {
@@ -176,6 +193,11 @@ fn main() -> Result<()> {
                     camera.resize(width, height);
                     fb = vec![(Vec3::ZERO, 0.0); (width * height) as usize];
                 }
+                Event::Mouse(me) => match me.kind {
+                    MouseEventKind::ScrollUp => camera.zoom(1.0 - hud.zoom_step),
+                    MouseEventKind::ScrollDown => camera.zoom(1.0 + hud.zoom_step),
+                    _ => {}
+                },
                 _ => {}
             }
         }
@@ -219,7 +241,7 @@ fn main() -> Result<()> {
         let _ = write!(out, "\x1b[1;{}H\x1b[97;40m{}\x1b[0m", col, fps_str);
 
         // ---- HUD overlay ----
-        hud.render(&mut out);
+        hud.render(&camera, &mut out);
 
         // ---- single flush ----
         let mut so = stdout().lock();

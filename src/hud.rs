@@ -2,6 +2,7 @@ use std::fmt::Write;
 
 use crossterm::event::KeyCode;
 
+use crate::camera::OrbitCamera;
 use crate::rasterize::RenderParams;
 
 /// What happened after the HUD processed a key.
@@ -194,7 +195,7 @@ impl HudState {
     }
 
     /// Append cursor-addressed ANSI escape lines to `out`.
-    pub fn render(&self, out: &mut String) {
+    pub fn render(&self, camera: &OrbitCamera, out: &mut String) {
         if !self.visible {
             return;
         }
@@ -224,6 +225,30 @@ impl HudState {
                 "\x1b[97;40m" // white on black
             };
             write_hud_line(out, row, sgr, &content);
+            row += 1;
+        }
+
+        // Camera state (read-only)
+        let header = format!("{:-<width$}", " -- Camera State ", width = HUD_WIDTH);
+        write_hud_line(out, row, "\x1b[90;40m", &header);
+        row += 1;
+
+        let pos = camera.position();
+        let rows: &[(&str, String)] = &[
+            ("yaw",    format!("{:>+8.3} rad", camera.yaw)),
+            ("pitch",  format!("{:>+8.3} rad", camera.pitch)),
+            ("radius", format!("{:>8.3}", camera.radius)),
+            ("fov_y",  format!("{:>7.1} deg", camera.fov_y.to_degrees())),
+            ("pos x",  format!("{:>+8.2}", pos.x)),
+            ("pos y",  format!("{:>+8.2}", pos.y)),
+            ("pos z",  format!("{:>+8.2}", pos.z)),
+            ("tgt x",  format!("{:>+8.2}", camera.target.x)),
+            ("tgt y",  format!("{:>+8.2}", camera.target.y)),
+            ("tgt z",  format!("{:>+8.2}", camera.target.z)),
+        ];
+        for (label, value) in rows {
+            let content = format!("   {:<12} {:>8}", label, value);
+            write_hud_line(out, row, "\x1b[97;40m", &content);
             row += 1;
         }
     }

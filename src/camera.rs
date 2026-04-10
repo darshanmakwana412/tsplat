@@ -62,6 +62,15 @@ impl OrbitCamera {
         self.radius = (self.radius * factor).max(1e-3);
     }
 
+    /// Translate the orbit target in the horizontal camera plane.
+    /// `dx` is right/left, `dz` is forward/backward (in camera-facing direction).
+    pub fn pan(&mut self, dx: f32, dz: f32) {
+        let (sy, cy) = self.yaw.sin_cos();
+        let forward = Vec3::new(-sy, 0.0, -cy);
+        let right = Vec3::new(cy, 0.0, -sy);
+        self.target += right * dx + forward * dz;
+    }
+
     pub fn resize(&mut self, width: u32, height: u32) {
         self.width = width;
         self.height = height;

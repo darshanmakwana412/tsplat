@@ -77,20 +77,20 @@ pub fn project(splats: &[Splat], camera: &OrbitCamera, params: &RenderParams) ->
 
             // ---- Jacobian of pinhole projection at (xv, yv, zv) ----
             // Projection (y-down framebuffer, RH view space with zc = -zv):
-            //   u =  fx * xv / zc + cx
-            //   v = -fy * yv / zc + cy       (flip so world-up → screen-up)
+            //   u = fx * xv / zc + cx
+            //   v = fy * yv / zc + cy
             //
-            // ∂u/∂xv =  fx/zc
-            // ∂u/∂zv =  fx * xv / zc²
-            // ∂v/∂yv = -fy/zc
-            // ∂v/∂zv = -fy * yv / zc²
+            // ∂u/∂xv = fx/zc
+            // ∂u/∂zv = fx * xv / zc²
+            // ∂v/∂yv = fy/zc
+            // ∂v/∂zv = fy * yv / zc²
             //
             // Pad to 3x3 (third row zero) so glam's Mat3 multiplication works.
             let zc2 = zc * zc;
             let j = Mat3::from_cols(
                 Vec3::new(fx / zc, 0.0, 0.0),
-                Vec3::new(0.0, -fy / zc, 0.0),
-                Vec3::new(fx * xv / zc2, -fy * yv / zc2, 0.0),
+                Vec3::new(0.0, fy / zc, 0.0),
+                Vec3::new(fx * xv / zc2, fy * yv / zc2, 0.0),
             );
 
             let jcov = j * cov3d_view * j.transpose();
@@ -125,7 +125,7 @@ pub fn project(splats: &[Splat], camera: &OrbitCamera, params: &RenderParams) ->
 
             // ---- Project center to pixel coords ----
             let sx = fx * xv / zc + cx;
-            let sy = -fy * yv / zc + cy;
+            let sy = fy * yv / zc + cy;
 
             let x0 = (sx - radius as f32).floor() as i32;
             let y0 = (sy - radius as f32).floor() as i32;
