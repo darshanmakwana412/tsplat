@@ -251,22 +251,10 @@ fn composite_splat(p: &Projected, fb: &mut [(Vec3, f32)], w: usize, params: &Ren
 /// Height in pixels of each horizontal tile for parallel composite.
 const TILE_HEIGHT: usize = 16;
 
-/// Front-to-back alpha composite into the RGB framebuffer, parallelised over
-/// horizontal tiles. Each tile owns a disjoint slice of the framebuffer so
-/// there are no data races. `num_threads` controls the rayon thread pool size
-/// (0 means use rayon's default, which is all logical cores).
-pub fn composite_parallel(
-    projected: &[Projected],
-    fb: &mut [(Vec3, f32)],
-    width: u32,
-    height: u32,
-    params: &RenderParams,
-    num_threads: usize,
-) {
-    let w = width as usize;
-    let h = height as usize;
-    // Build a custom thread pool if num_threads > 0, otherwise use global pool.
-    let pool = if num_threads > 0 {
+/// Build a rayon thread pool with the given number of threads.
+/// Returns `None` for 0 (use rayon global pool).
+pub fn build_thread_pool(num_threads: usize) -> Option<rayon::ThreadPool> {
+    if num_threads > 0 {
         Some(
             rayon::ThreadPoolBuilder::new()
                 .num_threads(num_threads)
@@ -275,7 +263,23 @@ pub fn composite_parallel(
         )
     } else {
         None
-    };
+    }
+}
+
+/// Front-to-back alpha composite into the RGB framebuffer, parallelised over
+/// horizontal tiles. Each tile owns a disjoint slice of the framebuffer so
+/// there are no data races. Pass a pre-built thread pool to avoid per-frame
+/// allocation overhead (use `build_thread_pool`).
+pub fn composite_parallel(
+    projected: &[Projected],
+    fb: &mut [(Vec3, f32)],
+    width: u32,
+    height: u32,
+    params: &RenderParams,
+    pool: &Option<rayon::ThreadPool>,
+) {
+    let w = width as usize;
+    let h = height as usize;
 
     let do_composite = |fb: &mut [(Vec3, f32)]| {
         // Split fb into tile-sized chunks and process in parallel.
@@ -339,8 +343,8 @@ pub fn composite_parallel(
             });
     };
 
-    match pool {
-        Some(ref p) => p.install(|| do_composite(fb)),
+    match pool.as_ref() {
+        Some(p) => p.install(|| do_composite(fb)),
         None => do_composite(fb),
     }
 }

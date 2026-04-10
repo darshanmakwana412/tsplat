@@ -15,7 +15,7 @@ use glam::Vec3;
 
 use tsplat::camera::OrbitCamera;
 use tsplat::framebuffer::render_halfblocks;
-use tsplat::rasterize::{RenderParams, composite_parallel, project, sort_by_depth};
+use tsplat::rasterize::{RenderParams, build_thread_pool, composite_parallel, project, sort_by_depth};
 use tsplat::splat::load_ply;
 
 fn scene_path() -> PathBuf {
@@ -149,6 +149,7 @@ fn main() {
     let fb_size = (args.width * args.height) as usize;
     let mut fb = vec![(Vec3::ZERO, 0.0f32); fb_size];
     let mut out = String::with_capacity(256 * 1024);
+    let pool = build_thread_pool(4);
 
     println!();
     println!("=== tsplat forward-pass benchmark ===");
@@ -160,12 +161,11 @@ fn main() {
 
     // Warmup
     for _ in 0..args.warmup {
-        for c in fb.iter_mut() {
-            *c = (Vec3::ZERO, 0.0);
-        }
+        // Fast zero-fill via memset.
+        unsafe { std::ptr::write_bytes(fb.as_mut_ptr(), 0, fb.len()); }
         let mut projected = project(&splats, &camera, &params);
         sort_by_depth(&mut projected);
-        composite_parallel(&projected, &mut fb, args.width, args.height, &params, 4);
+        composite_parallel(&projected, &mut fb, args.width, args.height, &params, &pool);
         render_halfblocks(&fb, args.width, args.height, &mut out);
     }
 
@@ -175,9 +175,8 @@ fn main() {
 
     for frame in 0..args.frames {
         // Clear
-        for c in fb.iter_mut() {
-            *c = (Vec3::ZERO, 0.0);
-        }
+        // Fast zero-fill via memset.
+        unsafe { std::ptr::write_bytes(fb.as_mut_ptr(), 0, fb.len()); }
 
         let frame_start = Instant::now();
 
@@ -193,7 +192,7 @@ fn main() {
 
         // Composite
         let t4 = Instant::now();
-        composite_parallel(&projected, &mut fb, args.width, args.height, &params, 4);
+        composite_parallel(&projected, &mut fb, args.width, args.height, &params, &pool);
         let t5 = Instant::now();
 
         // Halfblocks

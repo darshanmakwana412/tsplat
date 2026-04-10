@@ -20,7 +20,7 @@ mod splat;
 
 use camera::OrbitCamera;
 use hud::{HudAction, HudState};
-use rasterize::{composite_parallel, project, sort_by_depth};
+use rasterize::{build_thread_pool, composite_parallel, project, sort_by_depth};
 use splat::{Splat, load_ply};
 
 #[derive(ClapParser, Debug)]
@@ -122,6 +122,8 @@ fn main() -> Result<()> {
     let mut last_fps_report = Instant::now();
     let mut fps = 0.0_f32;
     let mut needs_reload = false;
+    let mut thread_pool = build_thread_pool(hud.num_threads);
+    let mut last_num_threads = hud.num_threads;
 
     loop {
         // ---- drain input (non-blocking) ----
@@ -214,13 +216,21 @@ fn main() -> Result<()> {
         }
 
         // ---- render ----
-        for c in fb.iter_mut() {
-            *c = (Vec3::ZERO, 0.0);
+        // Fast zero-fill: (Vec3::ZERO, 0.0) is all-zeros in memory.
+        // SAFETY: (Vec3, f32) is repr(C)-compatible, all-zero bits is valid.
+        unsafe {
+            std::ptr::write_bytes(fb.as_mut_ptr(), 0, fb.len());
         }
+        // Rebuild thread pool only when thread count changes.
+        if hud.num_threads != last_num_threads {
+            thread_pool = build_thread_pool(hud.num_threads);
+            last_num_threads = hud.num_threads;
+        }
+
         let render_params = &hud.render_params;
         let mut projected = project(&splats, &camera, render_params);
         sort_by_depth(&mut projected);
-        composite_parallel(&projected, &mut fb, width, height, render_params, hud.num_threads);
+        composite_parallel(&projected, &mut fb, width, height, render_params, &thread_pool);
         framebuffer::render_halfblocks(&fb, width, height, &mut out);
 
         // ---- FPS overlay ----
