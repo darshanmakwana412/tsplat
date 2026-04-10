@@ -154,13 +154,12 @@ pub fn project(splats: &[Splat], camera: &OrbitCamera, params: &RenderParams) ->
 }
 
 /// Sort front-to-back (smaller view-space depth = closer to camera).
-/// `sort_unstable_by` — this is the hot loop, stability doesn't matter.
+///
+/// Uses `sort_unstable_by_key` with bitcast u32 keys. Since all depths are
+/// positive (zc > 0), f32-to-u32 bitcast preserves ordering, and integer
+/// comparison is branchless (no NaN checks, no `partial_cmp` overhead).
 pub fn sort_by_depth(projected: &mut [Projected]) {
-    projected.sort_unstable_by(|a, b| {
-        a.depth
-            .partial_cmp(&b.depth)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    projected.sort_unstable_by_key(|p| p.depth.to_bits());
 }
 
 /// Front-to-back alpha composite into the RGB framebuffer (single-threaded).
