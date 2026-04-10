@@ -12,7 +12,7 @@ use glam::Vec3;
 
 use tsplat::camera::OrbitCamera;
 use tsplat::framebuffer::render_halfblocks;
-use tsplat::rasterize::{RenderParams, composite, project, sort_by_depth};
+use tsplat::rasterize::{RenderParams, ScratchBuffers, composite, project, sort_by_depth};
 use tsplat::splat::load_ply;
 
 /// Fixed terminal dimensions for benchmarking (120 cols x 40 rows = 120x80 pixel buffer).
@@ -67,11 +67,12 @@ fn bench_sort(c: &mut Criterion) {
     let pool = None;
     let base_projected = project(&splats, &camera, &params, &pool);
 
+    let mut scratch = ScratchBuffers::new();
     c.bench_function("sort_by_depth_200k", |b| {
         b.iter_batched(
             || base_projected.clone(),
             |mut projected| {
-                sort_by_depth(black_box(&mut projected));
+                sort_by_depth(black_box(&mut projected), black_box(&mut scratch));
                 black_box(projected);
             },
             criterion::BatchSize::LargeInput,
@@ -85,7 +86,8 @@ fn bench_composite(c: &mut Criterion) {
     let params = RenderParams::default();
     let pool = None;
     let mut projected = project(&splats, &camera, &params, &pool);
-    sort_by_depth(&mut projected);
+    let mut scratch = ScratchBuffers::new();
+    sort_by_depth(&mut projected, &mut scratch);
 
     c.bench_function("composite_200k", |b| {
         let mut fb = vec![(Vec3::ZERO, 0.0f32); (BENCH_WIDTH * BENCH_HEIGHT) as usize];
@@ -110,8 +112,9 @@ fn bench_halfblocks(c: &mut Criterion) {
     let camera = bench_camera();
     let params = RenderParams::default();
     let pool = None;
+    let mut scratch = ScratchBuffers::new();
     let mut projected = project(&splats, &camera, &params, &pool);
-    sort_by_depth(&mut projected);
+    sort_by_depth(&mut projected, &mut scratch);
     let mut fb = vec![(Vec3::ZERO, 0.0f32); (BENCH_WIDTH * BENCH_HEIGHT) as usize];
     composite(&projected, &mut fb, BENCH_WIDTH, BENCH_HEIGHT, &params);
 
@@ -130,6 +133,7 @@ fn bench_full_pipeline(c: &mut Criterion) {
     let params = RenderParams::default();
     let pool = None;
 
+    let mut scratch = ScratchBuffers::new();
     c.bench_function("full_pipeline_200k", |b| {
         let mut fb = vec![(Vec3::ZERO, 0.0f32); (BENCH_WIDTH * BENCH_HEIGHT) as usize];
         let mut out = String::with_capacity(256 * 1024);
@@ -141,7 +145,7 @@ fn bench_full_pipeline(c: &mut Criterion) {
             // Project
             let mut projected = project(&splats, &camera, &params, &pool);
             // Sort
-            sort_by_depth(&mut projected);
+            sort_by_depth(&mut projected, &mut scratch);
             // Composite
             composite(&projected, &mut fb, BENCH_WIDTH, BENCH_HEIGHT, &params);
             // Render

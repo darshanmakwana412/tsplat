@@ -20,7 +20,7 @@ mod splat;
 
 use camera::OrbitCamera;
 use hud::{HudAction, HudState};
-use rasterize::{build_thread_pool, composite_parallel, project, sort_by_depth};
+use rasterize::{ScratchBuffers, build_thread_pool, composite_parallel, project, sort_by_depth};
 use splat::{Splat, load_ply};
 
 #[derive(ClapParser, Debug)]
@@ -124,6 +124,7 @@ fn main() -> Result<()> {
     let mut needs_reload = false;
     let mut thread_pool = build_thread_pool(hud.num_threads);
     let mut last_num_threads = hud.num_threads;
+    let mut scratch = ScratchBuffers::new();
 
     loop {
         // ---- drain input (non-blocking) ----
@@ -229,7 +230,7 @@ fn main() -> Result<()> {
 
         let render_params = &hud.render_params;
         let mut projected = project(&splats, &camera, render_params, &thread_pool);
-        sort_by_depth(&mut projected);
+        sort_by_depth(&mut projected, &mut scratch);
         composite_parallel(&projected, &mut fb, width, height, render_params, &thread_pool);
         framebuffer::render_halfblocks(&fb, width, height, &mut out);
 

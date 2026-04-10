@@ -19,7 +19,7 @@ use glam::Vec3;
 
 use tsplat::camera::OrbitCamera;
 use tsplat::framebuffer::render_halfblocks;
-use tsplat::rasterize::{RenderParams, composite, project, sort_by_depth};
+use tsplat::rasterize::{RenderParams, ScratchBuffers, composite, project, sort_by_depth};
 use tsplat::splat::load_ply;
 
 const WIDTH: u32 = 120;
@@ -71,8 +71,9 @@ fn run_pipeline() -> (Vec<(Vec3, f32)>, String) {
     let pool = None; // use rayon global pool for tests
 
     let mut fb = vec![(Vec3::ZERO, 0.0f32); (WIDTH * HEIGHT) as usize];
+    let mut scratch = ScratchBuffers::new();
     let mut projected = project(&splats, &camera, &params, &pool);
-    sort_by_depth(&mut projected);
+    sort_by_depth(&mut projected, &mut scratch);
     composite(&projected, &mut fb, WIDTH, HEIGHT, &params);
 
     let mut out = String::with_capacity(256 * 1024);

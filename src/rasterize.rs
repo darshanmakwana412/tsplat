@@ -4,6 +4,20 @@ use rayon::prelude::*;
 use crate::camera::OrbitCamera;
 use crate::splat::Splat;
 
+/// Reusable per-frame scratch buffers to avoid heap allocation on every frame.
+pub struct ScratchBuffers {
+    /// Aux buffer for radix sort ping-pong.
+    pub sort_aux: Vec<Projected>,
+}
+
+impl ScratchBuffers {
+    pub fn new() -> Self {
+        Self {
+            sort_aux: Vec::new(),
+        }
+    }
+}
+
 /// Fast approximate exp(x) for x in [-87, 0]. Uses the Schraudolph trick:
 /// reinterpret a scaled+biased float as an IEEE 754 bit pattern.
 /// Accuracy: ~1-2% relative error, more than sufficient for Gaussian alpha.
@@ -188,62 +202,59 @@ pub fn project(
 }
 
 /// Sort front-to-back using a 2-pass 16-bit radix sort on bitcast u32 depth
-/// keys. Two passes over 16-bit digits (65536-entry histogram) vs four 8-bit
-/// passes trades histogram memory for fewer data passes. At 200k elements
-/// this consistently beats `sort_unstable_by_key`.
-pub fn sort_by_depth(projected: &mut [Projected]) {
+/// keys. Reuses the scratch buffer's aux array across frames to avoid
+/// per-frame allocation. Stack-allocated histograms avoid heap allocation.
+pub fn sort_by_depth(projected: &mut [Projected], scratch: &mut ScratchBuffers) {
     let n = projected.len();
     if n <= 1 {
         return;
     }
 
-    // Extract keys once.
-    let keys: Vec<u32> = projected.iter().map(|p| p.depth.to_bits()).collect();
+    // Reuse the aux buffer from scratch.
+    scratch.sort_aux.clear();
+    scratch.sort_aux.reserve(n.saturating_sub(scratch.sort_aux.capacity()));
+    unsafe { scratch.sort_aux.set_len(n); }
+    let aux = &mut scratch.sort_aux;
 
-    // Auxiliary buffer for the ping-pong.
-    let mut aux: Vec<Projected> = Vec::with_capacity(n);
-    unsafe { aux.set_len(n); }
+    // Both histograms can be computed in a single pass over the keys.
+    // Stack-allocated to avoid heap alloc.
+    let mut counts_lo = [0u32; 65536];
+    let mut counts_hi = [0u32; 65536];
+    for p in projected.iter() {
+        let k = p.depth.to_bits();
+        counts_lo[(k & 0xFFFF) as usize] += 1;
+        counts_hi[(k >> 16) as usize] += 1;
+    }
 
     // Pass 1: sort by low 16 bits (projected -> aux).
     {
-        let mut counts = vec![0u32; 65536];
-        for &k in &keys {
-            counts[(k & 0xFFFF) as usize] += 1;
-        }
-        let mut offsets = vec![0u32; 65536];
+        let mut offsets = [0u32; 65536];
         let mut sum = 0u32;
         for i in 0..65536 {
             offsets[i] = sum;
-            sum += counts[i];
+            sum += counts_lo[i];
         }
-        for (i, &k) in keys.iter().enumerate() {
-            let bucket = (k & 0xFFFF) as usize;
+        for p in projected.iter() {
+            let bucket = (p.depth.to_bits() & 0xFFFF) as usize;
             let pos = offsets[bucket] as usize;
             offsets[bucket] += 1;
-            aux[pos] = projected[i];
+            aux[pos] = *p;
         }
     }
 
-    // We need re-keyed values from aux for pass 2.
-    let keys2: Vec<u32> = aux.iter().map(|p| p.depth.to_bits()).collect();
-
     // Pass 2: sort by high 16 bits (aux -> projected).
     {
-        let mut counts = vec![0u32; 65536];
-        for &k in &keys2 {
-            counts[(k >> 16) as usize] += 1;
-        }
-        let mut offsets = vec![0u32; 65536];
+        let mut offsets = [0u32; 65536];
         let mut sum = 0u32;
         for i in 0..65536 {
             offsets[i] = sum;
-            sum += counts[i];
+            sum += counts_hi[i];
         }
-        for (i, &k) in keys2.iter().enumerate() {
-            let bucket = (k >> 16) as usize;
+        for p in aux.iter() {
+            let bucket = (p.depth.to_bits() >> 16) as usize;
             let pos = offsets[bucket] as usize;
             offsets[bucket] += 1;
-            projected[pos] = aux[i];
+            projected[pos] = *p;
         }
     }
 }
