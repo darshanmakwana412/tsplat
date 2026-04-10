@@ -17,23 +17,32 @@ pub struct Projected {
     pub opacity: f32,
 }
 
-/// Low-pass dilation constant added to the Cov2D diagonal to guarantee each
-/// splat covers at least ~one pixel. Matches LichtFeld's `eps2d = 0.3`.
-const EPS2D: f32 = 0.3;
+/// Runtime-tunable rendering parameters. Defaults match the original constants.
+#[derive(Clone, Copy, Debug)]
+pub struct RenderParams {
+    /// Low-pass dilation on the 2D covariance diagonal (LichtFeld `eps2d`).
+    pub eps2d: f32,
+    /// Minimum effective alpha to bother compositing (LichtFeld `ALPHA_THRESHOLD`).
+    pub alpha_threshold: f32,
+    /// Bbox extent in stddevs (3σ ≈ 99.7% of Gaussian mass).
+    pub extend_sigma: f32,
+    /// Accumulated alpha at which a pixel is considered opaque.
+    pub saturation: f32,
+}
 
-/// Skip a splat entirely once its effective alpha would be below this.
-/// Matches LichtFeld's `ALPHA_THRESHOLD = 1 / 255`.
-const ALPHA_THRESHOLD: f32 = 1.0 / 255.0;
-
-/// Splat bbox extent in units of stddev. 3σ ≈ 99.7% of the Gaussian mass.
-const EXTEND_SIGMA: f32 = 3.0;
-
-/// Early-out: once a pixel's accumulated alpha exceeds this, no more splats
-/// can contribute a visible amount.
-const SATURATION: f32 = 0.999;
+impl Default for RenderParams {
+    fn default() -> Self {
+        Self {
+            eps2d: 0.3,
+            alpha_threshold: 1.0 / 255.0,
+            extend_sigma: 3.0,
+            saturation: 0.999,
+        }
+    }
+}
 
 /// Project every splat. Parallel over splats (embarrassingly parallel).
-pub fn project(splats: &[Splat], camera: &OrbitCamera) -> Vec<Projected> {
+pub fn project(splats: &[Splat], camera: &OrbitCamera, params: &RenderParams) -> Vec<Projected> {
     let view = camera.view();
     let w_mat = Mat3::from_mat4(view);
     let (fx, fy, cx, cy) = camera.intrinsics();
@@ -93,8 +102,8 @@ pub fn project(splats: &[Splat], camera: &OrbitCamera) -> Vec<Projected> {
                 Vec2::new(jcov.y_axis.x, jcov.y_axis.y),
             );
             // Low-pass dilation on the diagonal.
-            cov2d.x_axis.x += EPS2D;
-            cov2d.y_axis.y += EPS2D;
+            cov2d.x_axis.x += params.eps2d;
+            cov2d.y_axis.y += params.eps2d;
 
             let det = cov2d.determinant();
             if det <= 0.0 {
@@ -106,7 +115,7 @@ pub fn project(splats: &[Splat], camera: &OrbitCamera) -> Vec<Projected> {
             let d = cov2d.y_axis.y;
             let b = 0.5 * (a + d);
             let lambda1 = b + (b * b - det).max(0.01).sqrt();
-            let radius_f = EXTEND_SIGMA * lambda1.sqrt();
+            let radius_f = params.extend_sigma * lambda1.sqrt();
             if !radius_f.is_finite() || radius_f < 1.0 {
                 return None;
             }
@@ -158,7 +167,7 @@ pub fn sort_by_depth(projected: &mut [Projected]) {
 ///
 /// `fb` is a packed `(rgb, accum_alpha)` buffer of length `width * height`,
 /// assumed to be zeroed at the start of each frame.
-pub fn composite(projected: &[Projected], fb: &mut [(Vec3, f32)], width: u32, _height: u32) {
+pub fn composite(projected: &[Projected], fb: &mut [(Vec3, f32)], width: u32, _height: u32, params: &RenderParams) {
     let w = width as usize;
     for p in projected {
         let [x0, y0, x1, y1] = p.bbox;
@@ -167,7 +176,7 @@ pub fn composite(projected: &[Projected], fb: &mut [(Vec3, f32)], width: u32, _h
             for px in x0..=x1 {
                 let idx = row + px as usize;
                 let cell = &mut fb[idx];
-                if cell.1 >= SATURATION {
+                if cell.1 >= params.saturation {
                     continue;
                 }
                 let d = Vec2::new(px as f32 - p.screen.x, py as f32 - p.screen.y);
@@ -176,7 +185,7 @@ pub fn composite(projected: &[Projected], fb: &mut [(Vec3, f32)], width: u32, _h
                     continue;
                 }
                 let alpha = (p.opacity * power.exp()).min(0.999);
-                if alpha < ALPHA_THRESHOLD {
+                if alpha < params.alpha_threshold {
                     continue;
                 }
                 let t = 1.0 - cell.1;

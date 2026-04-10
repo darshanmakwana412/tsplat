@@ -13,11 +13,13 @@ use glam::Vec3;
 
 mod camera;
 mod framebuffer;
+mod hud;
 mod rasterize;
 mod sh;
 mod splat;
 
 use camera::OrbitCamera;
+use hud::{HudAction, HudState};
 use rasterize::{composite, project, sort_by_depth};
 use splat::{Splat, load_ply};
 
@@ -87,8 +89,12 @@ fn main() -> Result<()> {
     let args = Args::parse();
 
     let cap = if args.no_cap { 0 } else { args.max_splats };
-    eprintln!("loading {} (cap: {}) ...", args.ply.display(), if cap == 0 { "none".into() } else { cap.to_string() });
-    let splats = load_ply(&args.ply, !args.raw_opacity, cap)?;
+    eprintln!(
+        "loading {} (cap: {}) ...",
+        args.ply.display(),
+        if cap == 0 { "none".into() } else { cap.to_string() }
+    );
+    let mut splats = load_ply(&args.ply, !args.raw_opacity, cap)?;
     eprintln!("loaded {} splats", splats.len());
 
     if args.dump_stats {
@@ -107,31 +113,61 @@ fn main() -> Result<()> {
     camera.target = center;
     camera.radius = radius * 2.5;
 
+    let mut hud = HudState::new(cap, !args.raw_opacity, camera.fov_y);
+
     let mut fb: Vec<(Vec3, f32)> = vec![(Vec3::ZERO, 0.0); (width * height) as usize];
     let mut out = String::with_capacity(256 * 1024);
 
     let mut frames_since_report = 0u32;
     let mut last_fps_report = Instant::now();
     let mut fps = 0.0_f32;
-
-    let yaw_step = 0.08_f32;
-    let pitch_step = 0.06_f32;
+    let mut needs_reload = false;
 
     loop {
         // ---- drain input (non-blocking) ----
         while event::poll(Duration::from_millis(0))? {
             match event::read()? {
                 Event::Key(k) => match k.code {
-                    KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
+                    KeyCode::Char('q') => return Ok(()),
+                    KeyCode::Esc => {
+                        if hud.visible {
+                            hud.toggle();
+                        } else {
+                            return Ok(());
+                        }
+                    }
                     KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => {
                         return Ok(());
                     }
-                    KeyCode::Char('h') | KeyCode::Left => camera.orbit(-yaw_step, 0.0),
-                    KeyCode::Char('l') | KeyCode::Right => camera.orbit(yaw_step, 0.0),
-                    KeyCode::Char('k') | KeyCode::Up => camera.orbit(0.0, pitch_step),
-                    KeyCode::Char('j') | KeyCode::Down => camera.orbit(0.0, -pitch_step),
-                    KeyCode::Char('+') | KeyCode::Char('=') => camera.zoom(0.9),
-                    KeyCode::Char('-') | KeyCode::Char('_') => camera.zoom(1.1),
+                    KeyCode::Tab => hud.toggle(),
+                    // Vim keys always control camera
+                    KeyCode::Char('h') => camera.orbit(-hud.yaw_step, 0.0),
+                    KeyCode::Char('l') => camera.orbit(hud.yaw_step, 0.0),
+                    KeyCode::Char('k') => camera.orbit(0.0, hud.pitch_step),
+                    KeyCode::Char('j') => camera.orbit(0.0, -hud.pitch_step),
+                    KeyCode::Char('+') | KeyCode::Char('=') => camera.zoom(1.0 - hud.zoom_step),
+                    KeyCode::Char('-') | KeyCode::Char('_') => camera.zoom(1.0 + hud.zoom_step),
+                    // Arrow keys: HUD when visible, camera when hidden
+                    KeyCode::Up | KeyCode::Down | KeyCode::Left | KeyCode::Right => {
+                        if hud.visible {
+                            let action = hud.handle_key(k.code);
+                            match action {
+                                HudAction::ReloadSplats => needs_reload = true,
+                                HudAction::ValueChanged => {
+                                    camera.fov_y = hud.fov_y_deg.to_radians();
+                                }
+                                HudAction::None => {}
+                            }
+                        } else {
+                            match k.code {
+                                KeyCode::Left => camera.orbit(-hud.yaw_step, 0.0),
+                                KeyCode::Right => camera.orbit(hud.yaw_step, 0.0),
+                                KeyCode::Up => camera.orbit(0.0, hud.pitch_step),
+                                KeyCode::Down => camera.orbit(0.0, -hud.pitch_step),
+                                _ => {}
+                            }
+                        }
+                    }
                     _ => {}
                 },
                 Event::Resize(new_cols, new_rows) => {
@@ -144,13 +180,25 @@ fn main() -> Result<()> {
             }
         }
 
+        // ---- reload splats if requested ----
+        if needs_reload {
+            {
+                let mut so = stdout().lock();
+                so.write_all(b"\x1b[1;1H\x1b[97;41m Loading... \x1b[0m")?;
+                so.flush()?;
+            }
+            splats = load_ply(&args.ply, hud.apply_sigmoid, hud.max_splats)?;
+            needs_reload = false;
+        }
+
         // ---- render ----
         for c in fb.iter_mut() {
             *c = (Vec3::ZERO, 0.0);
         }
-        let mut projected = project(&splats, &camera);
+        let render_params = &hud.render_params;
+        let mut projected = project(&splats, &camera, render_params);
         sort_by_depth(&mut projected);
-        composite(&projected, &mut fb, width, height);
+        composite(&projected, &mut fb, width, height, render_params);
         framebuffer::render_halfblocks(&fb, width, height, &mut out);
 
         // ---- FPS overlay ----
@@ -169,6 +217,9 @@ fn main() -> Result<()> {
             + 1; // 1-indexed
         use std::fmt::Write as _;
         let _ = write!(out, "\x1b[1;{}H\x1b[97;40m{}\x1b[0m", col, fps_str);
+
+        // ---- HUD overlay ----
+        hud.render(&mut out);
 
         // ---- single flush ----
         let mut so = stdout().lock();
