@@ -1,0 +1,3 @@
+[submodule "ProteinView"]
+	path = ProteinView
+	url = https://github.com/001TMF/ProteinView
