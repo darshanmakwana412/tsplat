@@ -34,7 +34,15 @@ fn sigmoid(x: f32) -> f32 {
 ///
 /// `apply_sigmoid_opacity`: `true` for vanilla INRIA files (opacity stored as
 /// a pre-sigmoid logit).  Pass `false` if the scene looks uniformly hazy.
-pub fn load_ply(path: &Path, apply_sigmoid_opacity: bool, max_splats: usize) -> Result<Vec<Splat>> {
+///
+/// Returns `(splats, total_vertex_count)` where `total_vertex_count` is the
+/// full count declared in the PLY header (used by the HUD to cap the
+/// `max_splats` slider to the scene's real size rather than a magic ceiling).
+pub fn load_ply(
+    path: &Path,
+    apply_sigmoid_opacity: bool,
+    max_splats: usize,
+) -> Result<(Vec<Splat>, usize)> {
     let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
     // Large read buffer — the binary body can be hundreds of MB.
     let mut reader = BufReader::with_capacity(4 * 1024 * 1024, file);
@@ -163,5 +171,5 @@ pub fn load_ply(path: &Path, apply_sigmoid_opacity: bool, max_splats: usize) -> 
         splats.push(Splat { pos, scale, rot, color, opacity });
     }
 
-    Ok(splats)
+    Ok((splats, vertex_count))
 }

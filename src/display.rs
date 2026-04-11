@@ -274,6 +274,9 @@ pub struct Display {
     frame: String,
     /// Kitty image id, incremented to avoid stale image artifacts.
     kitty_img_id: u32,
+    /// When true, the next `render()` prepends `ED 2` + home to wipe the
+    /// terminal text layer. Set via `queue_text_clear()` on transitions.
+    pending_text_clear: bool,
 }
 
 impl Display {
@@ -300,6 +303,7 @@ impl Display {
             pixel_density: 1.0,
             frame: String::with_capacity(512 * 1024),
             kitty_img_id: 1000,
+            pending_text_clear: false,
         }
     }
 
@@ -338,6 +342,13 @@ impl Display {
                 self.render_kitty(fb, width, height);
             }
         }
+        if self.pending_text_clear {
+            // Both backends start the frame with `\x1b[H`. Prepending
+            // `\x1b[2J` makes the full sequence `ED 2` then home, which wipes
+            // stale text without disturbing the Kitty image layer.
+            self.frame.insert_str(0, "\x1b[2J");
+            self.pending_text_clear = false;
+        }
     }
 
     /// Returns a mutable reference to the frame string so the caller can
@@ -346,6 +357,18 @@ impl Display {
     /// absolute cursor positioning.
     pub fn overlay_string(&mut self) -> &mut String {
         &mut self.frame
+    }
+
+    /// Erase the terminal text layer at the start of the next frame. In Kitty
+    /// the image is placed under text (see `KITTY_IMG_Z_UNDER_UI`) so stale
+    /// halfblock characters or HUD cells would otherwise stay visible on top
+    /// of a newly-transmitted image. `ED 2` only touches the text layer —
+    /// Kitty graphics are retained.
+    ///
+    /// Callers should invoke this before `render()` on transitions: backend
+    /// switch, HUD hide-in-kitty, resize, density change.
+    pub fn queue_text_clear(&mut self) {
+        self.pending_text_clear = true;
     }
 
     /// Write the complete frame to stdout in one shot.
@@ -402,10 +425,15 @@ impl Display {
                 // a=T transmit+display, f=24 RGB, t=d direct,
                 // s/v pixel dims, c/r cell dims for scaling,
                 // i=id p=1 for flicker-free replacement, q=2 suppress response,
+                // C=1 keeps the cursor where it was — without it, placing a
+                // `rows`-tall image from (1,1) advances the cursor past the
+                // bottom of the alt-screen and the terminal scrolls up one
+                // line per frame, which is what produced the "slide up" when
+                // toggling halfblock → kitty.
                 use std::fmt::Write;
                 let _ = write!(
                     self.frame,
-                    "\x1b_Ga=T,f=24,t=d,s={},v={},c={},r={},i={},p=1,q=2,z={},m={};",
+                    "\x1b_Ga=T,f=24,t=d,s={},v={},c={},r={},i={},p=1,q=2,C=1,z={},m={};",
                     width, height, self.cols, self.rows, self.kitty_img_id, KITTY_IMG_Z_UNDER_UI, m,
                 );
             } else {

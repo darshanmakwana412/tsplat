@@ -65,7 +65,7 @@ fn fb_to_bytes(fb: &[(Vec3, f32)]) -> Vec<u8> {
 }
 
 fn run_pipeline() -> (Vec<(Vec3, f32)>, String) {
-    let splats = load_ply(&scene_path(), true, MAX_SPLATS).expect("failed to load scene");
+    let (splats, _total) = load_ply(&scene_path(), true, MAX_SPLATS).expect("failed to load scene");
     let camera = bench_camera();
     let params = RenderParams::default();
     let pool = None; // use rayon global pool for tests

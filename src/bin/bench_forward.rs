@@ -135,7 +135,7 @@ fn main() {
     let args = parse_args();
 
     eprintln!("Loading scene...");
-    let splats = load_ply(&scene_path(), true, args.max_splats).expect("failed to load scene");
+    let (splats, _total) = load_ply(&scene_path(), true, args.max_splats).expect("failed to load scene");
     eprintln!("Loaded {} splats", splats.len());
 
     let mut camera = OrbitCamera::new(args.width, args.height);

@@ -95,6 +95,10 @@ pub struct HudState {
 
     // -- Reload parameters --
     pub max_splats: usize,
+    /// Total vertex count declared in the PLY header. Used as the ceiling for
+    /// the MaxSplats slider so the user can actually reach "all of it" instead
+    /// of a magic 10M cap.
+    pub total_splats: usize,
     pub apply_sigmoid: bool,
 
     // -- Performance parameters (real-time) --
@@ -116,11 +120,26 @@ pub struct HudState {
 }
 
 impl HudState {
-    pub fn new(max_splats: usize, apply_sigmoid: bool, fov_y_rad: f32, display: &Display) -> Self {
+    pub fn new(
+        max_splats: usize,
+        total_splats: usize,
+        apply_sigmoid: bool,
+        fov_y_rad: f32,
+        display: &Display,
+    ) -> Self {
+        // `max_splats == 0` (CLI --no-cap) means "load everything" which we
+        // represent internally as "equal to the scene total" so the HUD slider
+        // has a concrete value to show and clamp to.
+        let max_splats = if max_splats == 0 || max_splats > total_splats {
+            total_splats
+        } else {
+            max_splats
+        };
         Self {
             visible: false,
             cursor: 0,
             max_splats,
+            total_splats,
             apply_sigmoid,
             num_threads: 4,
             backend: display.backend,
@@ -163,11 +182,18 @@ impl HudState {
         let item = ITEMS[self.cursor].item;
         match item {
             HudItem::MaxSplats => {
-                self.max_splats = if dir > 0 {
-                    (self.max_splats * 2).min(10_000_000)
+                let new_val = if dir > 0 {
+                    // Right-arrow at or above the scene total snaps to the
+                    // full count (covers the "one more tap to go all the
+                    // way" case when 2x would overshoot).
+                    (self.max_splats.saturating_mul(2)).min(self.total_splats.max(1_000))
                 } else {
                     (self.max_splats / 2).max(1_000)
                 };
+                if new_val == self.max_splats {
+                    return HudAction::None;
+                }
+                self.max_splats = new_val;
                 HudAction::ReloadSplats
             }
             HudItem::Sigmoid => {
@@ -251,10 +277,15 @@ impl HudState {
     fn format_value(&self, item: HudItem) -> String {
         match item {
             HudItem::MaxSplats => {
-                if self.max_splats >= 1_000_000 {
-                    format!("{}M", self.max_splats / 1_000_000)
+                let label = if self.max_splats >= 1_000_000 {
+                    format!("{:.1}M", self.max_splats as f32 / 1_000_000.0)
                 } else {
                     format!("{}k", self.max_splats / 1_000)
+                };
+                if self.total_splats > 0 && self.max_splats >= self.total_splats {
+                    format!("all/{label}")
+                } else {
+                    label
                 }
             }
             HudItem::Sigmoid => {

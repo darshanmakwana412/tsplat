@@ -47,7 +47,7 @@ fn bench_camera() -> OrbitCamera {
 }
 
 fn bench_project(c: &mut Criterion) {
-    let splats = load_ply(&scene_path(), true, 200_000).expect("failed to load scene");
+    let (splats, _total) = load_ply(&scene_path(), true, 200_000).expect("failed to load scene");
     let camera = bench_camera();
     let params = RenderParams::default();
     let pool = None;
@@ -61,7 +61,7 @@ fn bench_project(c: &mut Criterion) {
 }
 
 fn bench_sort(c: &mut Criterion) {
-    let splats = load_ply(&scene_path(), true, 200_000).expect("failed to load scene");
+    let (splats, _total) = load_ply(&scene_path(), true, 200_000).expect("failed to load scene");
     let camera = bench_camera();
     let params = RenderParams::default();
     let pool = None;
@@ -81,7 +81,7 @@ fn bench_sort(c: &mut Criterion) {
 }
 
 fn bench_composite(c: &mut Criterion) {
-    let splats = load_ply(&scene_path(), true, 200_000).expect("failed to load scene");
+    let (splats, _total) = load_ply(&scene_path(), true, 200_000).expect("failed to load scene");
     let camera = bench_camera();
     let params = RenderParams::default();
     let pool = None;
@@ -108,7 +108,7 @@ fn bench_composite(c: &mut Criterion) {
 }
 
 fn bench_halfblocks(c: &mut Criterion) {
-    let splats = load_ply(&scene_path(), true, 200_000).expect("failed to load scene");
+    let (splats, _total) = load_ply(&scene_path(), true, 200_000).expect("failed to load scene");
     let camera = bench_camera();
     let params = RenderParams::default();
     let pool = None;
@@ -128,7 +128,7 @@ fn bench_halfblocks(c: &mut Criterion) {
 }
 
 fn bench_full_pipeline(c: &mut Criterion) {
-    let splats = load_ply(&scene_path(), true, 200_000).expect("failed to load scene");
+    let (splats, _total) = load_ply(&scene_path(), true, 200_000).expect("failed to load scene");
     let camera = bench_camera();
     let params = RenderParams::default();
     let pool = None;
