@@ -22,7 +22,7 @@ cargo run --release -- path/to/scene.ply --no-cap
 cargo run --release -- path/to/scene.ply --raw-opacity
 ```
 
-Controls inside the viewer: `h/j/k/l` or arrows to orbit, `+`/`-` to zoom, `q`/`Esc`/`Ctrl-C` to quit.
+Controls inside the viewer: `WASD` pans in the camera frame; `J`/`K` and Left/Right yaw; `H`/`L` and Up/Down pitch; `+`/`-` and mouse wheel zoom. `Tab` toggles the HUD (with HUD open, arrows move the row and adjust values). `q`/`Esc`/`Ctrl-C` to quit.
 
 Reference test scene is the INRIA 3DGS garden scene, expected at `~/datasets/3dgs/garden.ply`. It is not tracked in the repo and `.ply` is in `.gitignore`.
 

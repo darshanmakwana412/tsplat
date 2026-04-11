@@ -87,6 +87,34 @@ fn scene_bounds(splats: &[Splat]) -> (Vec3, f32) {
     (center, radius.max(1.0))
 }
 
+fn apply_hud_key_action(
+    action: HudAction,
+    hud: &HudState,
+    camera: &mut OrbitCamera,
+    display: &mut Display,
+    needs_reload: &mut bool,
+    needs_fb_resize: &mut bool,
+) {
+    match action {
+        HudAction::ReloadSplats => *needs_reload = true,
+        HudAction::ValueChanged => {
+            camera.fov_y = hud.fov_y_deg.to_radians();
+        }
+        HudAction::BackendChanged => {
+            display.backend = hud.backend;
+            display.kitty_cleanup();
+            display.queue_text_clear();
+            *needs_fb_resize = true;
+        }
+        HudAction::DensityChanged => {
+            display.pixel_density = hud.pixel_density;
+            display.queue_text_clear();
+            *needs_fb_resize = true;
+        }
+        HudAction::None => {}
+    }
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
 
@@ -262,11 +290,23 @@ fn main() -> Result<()> {
                         }
                         needs_redraw = true;
                     }
-                    // Vim keys always control camera
-                    KeyCode::Char('h') => { camera.orbit(-hud.yaw_step, 0.0); needs_redraw = true; }
-                    KeyCode::Char('l') => { camera.orbit(hud.yaw_step, 0.0); needs_redraw = true; }
-                    KeyCode::Char('k') => { camera.orbit(0.0, hud.pitch_step); needs_redraw = true; }
-                    KeyCode::Char('j') => { camera.orbit(0.0, -hud.pitch_step); needs_redraw = true; }
+                    // H/L + Up/Down: pitch; J/K + Left/Right: yaw (camera-relative orbit).
+                    KeyCode::Char('h') | KeyCode::Char('H') => {
+                        camera.orbit(0.0, hud.rotation_speed);
+                        needs_redraw = true;
+                    }
+                    KeyCode::Char('l') | KeyCode::Char('L') => {
+                        camera.orbit(0.0, -hud.rotation_speed);
+                        needs_redraw = true;
+                    }
+                    KeyCode::Char('j') | KeyCode::Char('J') => {
+                        camera.orbit(-hud.rotation_speed, 0.0);
+                        needs_redraw = true;
+                    }
+                    KeyCode::Char('k') | KeyCode::Char('K') => {
+                        camera.orbit(hud.rotation_speed, 0.0);
+                        needs_redraw = true;
+                    }
                     KeyCode::Char('+') | KeyCode::Char('=') => {
                         camera.zoom(1.0 - hud.zoom_step);
                         needs_redraw = true;
@@ -275,58 +315,68 @@ fn main() -> Result<()> {
                         camera.zoom(1.0 + hud.zoom_step);
                         needs_redraw = true;
                     }
-                    // WASD: spatial pan
+                    // WASD: view-relative pan (speed from HUD).
                     KeyCode::Char('w') | KeyCode::Char('W') => {
-                        let step = camera.radius * 0.05;
+                        let step = camera.radius * hud.translate_speed;
                         camera.pan(0.0, step);
                         needs_redraw = true;
                     }
                     KeyCode::Char('s') | KeyCode::Char('S') => {
-                        let step = camera.radius * 0.05;
+                        let step = camera.radius * hud.translate_speed;
                         camera.pan(0.0, -step);
                         needs_redraw = true;
                     }
                     KeyCode::Char('a') | KeyCode::Char('A') => {
-                        let step = camera.radius * 0.05;
+                        let step = camera.radius * hud.translate_speed;
                         camera.pan(-step, 0.0);
                         needs_redraw = true;
                     }
                     KeyCode::Char('d') | KeyCode::Char('D') => {
-                        let step = camera.radius * 0.05;
+                        let step = camera.radius * hud.translate_speed;
                         camera.pan(step, 0.0);
                         needs_redraw = true;
                     }
-                    // Arrow keys: HUD when visible, camera when hidden
+                    // Arrows: HUD when open, else camera orbit (same mapping as J/K and H/L).
                     KeyCode::Up | KeyCode::Down | KeyCode::Left | KeyCode::Right => {
                         if hud.visible {
                             let action = hud.handle_key(k.code);
-                            match action {
-                                HudAction::ReloadSplats => needs_reload = true,
-                                HudAction::ValueChanged => {
-                                    camera.fov_y = hud.fov_y_deg.to_radians();
-                                }
-                                HudAction::BackendChanged => {
-                                    display.backend = hud.backend;
-                                    display.kitty_cleanup();
-                                    display.queue_text_clear();
-                                    needs_fb_resize = true;
-                                }
-                                HudAction::DensityChanged => {
-                                    display.pixel_density = hud.pixel_density;
-                                    display.queue_text_clear();
-                                    needs_fb_resize = true;
-                                }
-                                HudAction::None => {}
-                            }
+                            apply_hud_key_action(
+                                action,
+                                &hud,
+                                &mut camera,
+                                &mut display,
+                                &mut needs_reload,
+                                &mut needs_fb_resize,
+                            );
                             needs_redraw = true;
                         } else {
                             match k.code {
-                                KeyCode::Left => camera.orbit(-hud.yaw_step, 0.0),
-                                KeyCode::Right => camera.orbit(hud.yaw_step, 0.0),
-                                KeyCode::Up => camera.orbit(0.0, hud.pitch_step),
-                                KeyCode::Down => camera.orbit(0.0, -hud.pitch_step),
+                                KeyCode::Left => camera.orbit(-hud.rotation_speed, 0.0),
+                                KeyCode::Right => camera.orbit(hud.rotation_speed, 0.0),
+                                KeyCode::Up => camera.orbit(0.0, hud.rotation_speed),
+                                KeyCode::Down => camera.orbit(0.0, -hud.rotation_speed),
                                 _ => {}
                             }
+                            needs_redraw = true;
+                        }
+                    }
+                    // Same HUD behavior without using arrow keys (optional).
+                    KeyCode::PageUp
+                    | KeyCode::PageDown
+                    | KeyCode::Char(',')
+                    | KeyCode::Char('.')
+                    | KeyCode::Char('<')
+                    | KeyCode::Char('>') => {
+                        if hud.visible {
+                            let action = hud.handle_key(k.code);
+                            apply_hud_key_action(
+                                action,
+                                &hud,
+                                &mut camera,
+                                &mut display,
+                                &mut needs_reload,
+                                &mut needs_fb_resize,
+                            );
                             needs_redraw = true;
                         }
                     }

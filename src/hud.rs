@@ -54,8 +54,8 @@ enum HudItem {
     RenderBackend,
     PixelDensity,
     FovY,
-    YawStep,
-    PitchStep,
+    TranslateSpeed,
+    RotationSpeed,
     ZoomStep,
     Eps2d,
     AlphaThreshold,
@@ -77,8 +77,8 @@ const ITEMS: &[Entry] = &[
     Entry { group: None,             item: HudItem::PixelDensity,    label: "px density" },
     Entry { group: Some("Perf"),     item: HudItem::NumThreads,      label: "threads" },
     Entry { group: Some("Camera"),   item: HudItem::FovY,            label: "fov_y" },
-    Entry { group: None,             item: HudItem::YawStep,         label: "orbit spd" },
-    Entry { group: None,             item: HudItem::PitchStep,       label: "pitch spd" },
+    Entry { group: None,             item: HudItem::TranslateSpeed,  label: "move spd" },
+    Entry { group: None,             item: HudItem::RotationSpeed,   label: "rot spd" },
     Entry { group: None,             item: HudItem::ZoomStep,        label: "zoom spd" },
     Entry { group: Some("Render"),   item: HudItem::Eps2d,           label: "eps2d" },
     Entry { group: None,             item: HudItem::AlphaThreshold,  label: "alpha thr" },
@@ -111,8 +111,11 @@ pub struct HudState {
 
     // -- Camera parameters (real-time) --
     pub fov_y_deg: f32,
-    pub yaw_step: f32,
-    pub pitch_step: f32,
+    /// Pan distance per key as a fraction of orbit radius (WASD).
+    pub translate_speed: f32,
+    /// Radians per key for yaw and pitch (HJKL / arrows).
+    pub rotation_speed: f32,
+    /// Multiplicative zoom factor per +/- or scroll tick (see `OrbitCamera::zoom`).
     pub zoom_step: f32,
 
     // -- Render parameters (real-time) --
@@ -146,9 +149,9 @@ impl HudState {
             detected_backend: display.detected_backend,
             pixel_density: display.pixel_density,
             fov_y_deg: fov_y_rad.to_degrees(),
-            yaw_step: 0.08,
-            pitch_step: 0.06,
-            zoom_step: 0.1,
+            translate_speed: 0.02,
+            rotation_speed: 0.035,
+            zoom_step: 0.06,
             render_params: RenderParams::default(),
         }
     }
@@ -157,10 +160,12 @@ impl HudState {
         self.visible = !self.visible;
     }
 
-    /// Process an arrow key while the HUD is visible.
+    /// Process HUD navigation while the panel is visible: Up/Down move the
+    /// selection, Left/Right adjust the focused value. PgUp/PgDn and `,` /
+    /// `.` are aliases for the same actions.
     pub fn handle_key(&mut self, code: KeyCode) -> HudAction {
         match code {
-            KeyCode::Up => {
+            KeyCode::Up | KeyCode::PageUp => {
                 if self.cursor == 0 {
                     self.cursor = ITEMS.len() - 1;
                 } else {
@@ -168,12 +173,12 @@ impl HudState {
                 }
                 HudAction::None
             }
-            KeyCode::Down => {
+            KeyCode::Down | KeyCode::PageDown => {
                 self.cursor = (self.cursor + 1) % ITEMS.len();
                 HudAction::None
             }
-            KeyCode::Left => self.adjust(-1),
-            KeyCode::Right => self.adjust(1),
+            KeyCode::Left | KeyCode::Char(',') | KeyCode::Char('<') => self.adjust(-1),
+            KeyCode::Right | KeyCode::Char('.') | KeyCode::Char('>') => self.adjust(1),
             _ => HudAction::None,
         }
     }
@@ -183,7 +188,7 @@ impl HudState {
         match item {
             HudItem::MaxSplats => {
                 let new_val = if dir > 0 {
-                    // Right-arrow at or above the scene total snaps to the
+                    // Increase (right / `.`) at or above the scene total snaps to the
                     // full count (covers the "one more tap to go all the
                     // way" case when 2x would overshoot).
                     (self.max_splats.saturating_mul(2)).min(self.total_splats.max(1_000))
@@ -236,12 +241,14 @@ impl HudState {
                 self.fov_y_deg = (self.fov_y_deg + dir as f32 * 5.0).clamp(10.0, 150.0);
                 HudAction::ValueChanged
             }
-            HudItem::YawStep => {
-                self.yaw_step = (self.yaw_step + dir as f32 * 0.01).clamp(0.01, 0.50);
+            HudItem::TranslateSpeed => {
+                self.translate_speed =
+                    (self.translate_speed + dir as f32 * 0.005).clamp(0.01, 0.25);
                 HudAction::ValueChanged
             }
-            HudItem::PitchStep => {
-                self.pitch_step = (self.pitch_step + dir as f32 * 0.01).clamp(0.01, 0.50);
+            HudItem::RotationSpeed => {
+                self.rotation_speed =
+                    (self.rotation_speed + dir as f32 * 0.01).clamp(0.01, 0.50);
                 HudAction::ValueChanged
             }
             HudItem::ZoomStep => {
@@ -310,8 +317,8 @@ impl HudState {
                 }
             }
             HudItem::FovY => format!("{:.0}", self.fov_y_deg),
-            HudItem::YawStep => format!("{:.2}", self.yaw_step),
-            HudItem::PitchStep => format!("{:.2}", self.pitch_step),
+            HudItem::TranslateSpeed => format!("{:.3}", self.translate_speed),
+            HudItem::RotationSpeed => format!("{:.2}", self.rotation_speed),
             HudItem::ZoomStep => format!("{:.2}", self.zoom_step),
             HudItem::Eps2d => format!("{:.2}", self.render_params.eps2d),
             HudItem::AlphaThreshold => format!("{:.4}", self.render_params.alpha_threshold),
