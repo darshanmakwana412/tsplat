@@ -22,7 +22,7 @@ mod splat;
 use camera::OrbitCamera;
 use display::{Backend, Display};
 use hud::{DisplayInfo, HudAction, HudState};
-use rasterize::{ScratchBuffers, build_thread_pool, composite_parallel, project, sort_by_depth};
+use rasterize::{ScratchBuffers, build_thread_pool, composite_parallel, project, sort_by_depth_parallel};
 use splat::{Splat, load_ply};
 
 #[derive(ClapParser, Debug)]
@@ -208,8 +208,8 @@ fn main() -> Result<()> {
 
             let render_params = &hud.render_params;
             let mut projected = project(&splats, &camera, render_params, &thread_pool);
-            sort_by_depth(&mut projected, &mut scratch);
-            composite_parallel(&projected, &mut fb, width, height, render_params, &thread_pool);
+            sort_by_depth_parallel(&mut projected, &mut scratch, &thread_pool);
+            composite_parallel(&projected, &mut fb, width, height, render_params, &mut scratch, &thread_pool);
 
             // Convert framebuffer to terminal output.
             display.render(&fb, width, height);

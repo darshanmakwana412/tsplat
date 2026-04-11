@@ -1,6 +1,6 @@
 # tsplat
 
-tsplat is a terminal-based 3D Gaussian Splatting renderer written in Rust. It rasterizes on the CPU and draws directly into the terminal using half-block characters with 24-bit truecolor. The premise is that a 120x40 terminal with half blocks is only ~9600 pixels, so CPU rasterization that would be laughable at HD becomes real-time at terminal resolution, and the true bottleneck is the depth sort, not shading.
+tsplat is a terminal-based 3D Gaussian Splatting renderer written in Rust. It rasterizes on the CPU into an RGB framebuffer, then draws to the terminal either with **Unicode half-block** characters (24-bit truecolor SGR) or, when available, the **Kitty graphics protocol** for higher per-cell resolution. At ~120×80 pixels (half-block) the cost is dominated by **depth ordering and compositing**, so the forward pass has been heavily optimized: Jacobian projection with ILP-friendly math, **FlashGS-style opacity-aware 2D bboxes**, **16-bit radix depth sort**, optional **parallel float sort** for very large splat counts, **2D tile binning**, and **parallel per-tile compositing** with a fast approximate `exp` on the Gaussian falloff.
 
 ## Build and run
 
@@ -8,7 +8,7 @@ tsplat is a terminal-based 3D Gaussian Splatting renderer written in Rust. It ra
 # Build (release is required for interactive FPS)
 cargo build --release
 
-# Run against an INRIA 3DGS .ply scene
+# Run against an INRIA 3DGS `.ply` scene
 cargo run --release -- path/to/scene.ply
 
 # Non-interactive smoke test: loads, prints count, exits
@@ -22,75 +22,121 @@ cargo run --release -- path/to/scene.ply --no-cap
 cargo run --release -- path/to/scene.ply --raw-opacity
 ```
 
-Controls inside the viewer: `WASD` pans in the camera frame; `J`/`K` and Left/Right yaw; `H`/`L` and Up/Down pitch; `+`/`-` and mouse wheel zoom. `Tab` toggles the HUD (with HUD open, arrows move the row and adjust values). `q`/`Esc`/`Ctrl-C` to quit.
+### Synthetic benchmark binary (no `.ply` required)
 
-Reference test scene is the INRIA 3DGS garden scene, expected at `~/datasets/3dgs/garden.ply`. It is not tracked in the repo and `.ply` is in `.gitignore`.
+```sh
+cargo run --release --bin bench_forward
+cargo run --release --bin bench_forward -- --threads 1,2,4,8 --splats 200000
+cargo run --release --bin bench_forward -- --ply path/to/scene.ply
+```
+
+### Tests
+
+```sh
+# Regression suite: deterministic synthetic scene, serial vs parallel equivalence
+cargo test --release --test regression
+```
+
+### Criterion (optional; needs a garden `.ply` on disk)
+
+```sh
+cargo bench --bench forward_pass
+```
+
+Expects `data/garden/point_cloud.ply` or `~/datasets/3dgs/garden.ply` (see `benches/forward_pass.rs`).
+
+## Display backends
+
+- **`Backend::HalfBlock`** (default): `framebuffer::render_halfblocks` packs two vertical pixels per cell using U+2580 and truecolor fg/bg.
+- **`Backend::Kitty`**: probes Kitty graphics support at startup (`display::probe_kitty_support`); sends RGB as Kitty image fragments with a **negative z-index** so the splat layer stays under normal text (FPS strip and HUD). Switchable from the HUD when the terminal reports support.
+
+**`Display`** (`display.rs`) owns backend choice, terminal size, **per-cell pixel size** (query + defaults), **pixel density** multiplier for Kitty/hires framebuffer sizing, text-clear / resize coordination, and routes `render()` to the appropriate encoder.
+
+## Controls
+
+- **Camera:** `WASD` pans in the camera frame (step scales with orbit radius × HUD move speed). `J` / `K` and **Left** / **Right** yaw; `H` / `L` and **Up** / **Down** pitch. `+` / `-` and mouse wheel zoom.
+- **`Tab`:** toggles the HUD. While the HUD is open, **arrows** move the highlighted row and adjust values; **PgUp** / **PgDn** move the cursor; **`,`** / **`.`** (and `<` / `>` where emitted) nudge values without arrows.
+- **Quit:** `q`, `Esc` (closes HUD first if open), `Ctrl-C`.
+
+Reference test scene is the INRIA 3DGS garden, often at `~/datasets/3dgs/garden.ply`. It is not tracked; `.ply` is in `.gitignore`.
 
 ## Crate layout
 
 ```
 tsplat/
-  Cargo.toml                 # glam, crossterm, rayon, ply-rs, clap, anyhow
+  Cargo.toml                 # glam, crossterm, rayon, clap, anyhow; libc (unix); criterion for benches
+  benches/
+    forward_pass.rs          # Criterion: project/sort/composite stages (requires .ply)
   docs/
-    plan/plan.md             # MVP implementation plan (source of truth for scope)
-    agents/handoff/          # Per-session handoff notes for future agents
-  LichtFeld-Studio/          # C++ reference submodule, reference only, do not modify
+    plan/plan.md             # Original weekend MVP plan (historical scope doc)
+    agents/handoff/          # Per-session handoff notes — read the newest before big changes
+  LichtFeld-Studio/          # C++ reference submodule — do not modify
   src/
-    main.rs                  # CLI, event loop, terminal guard, FPS overlay
-    splat.rs                 # Splat struct, PLY loader, uniform downsample
-    camera.rs                # OrbitCamera: view matrix, intrinsics, controls
-    rasterize.rs             # project(), sort_by_depth(), composite()
-    framebuffer.rs           # RGB buffer to half-block ANSI string
-    sh.rs                    # SH_C0 constant and band-0 to RGB
+    lib.rs                   # Library surface: camera, framebuffer, rasterize, sh, splat (used by tests/benches)
+    main.rs                  # Binary: CLI, terminal guard, event loop, HUD, Display wiring
+    splat.rs                 # Splat, PLY loader, uniform downsample, deterministic synthetic `random_scene`
+    camera.rs                # OrbitCamera: view, intrinsics, orbit / pan / zoom
+    rasterize.rs             # project, depth sort, tile binning, serial + parallel composite
+    framebuffer.rs           # Half-block ANSI encoding
+    display.rs               # Backend probe, Kitty + half-block output paths
+    hud.rs                   # Tab HUD: splat cap, threads, render params, backend, density, camera speeds
+    sh.rs                    # SH band-0 to RGB
+  src/bin/
+    bench_forward.rs         # Thread-scaling forward-pass stats (synthetic or `--ply`)
+  tests/
+    regression.rs            # Synthetic scene determinism + parallel vs serial framebuffer match
 ```
 
 ## Architecture
 
-The render pipeline is one pass per frame, wired together in `main.rs`:
+The **interactive** render path in `main.rs` only recomputes the framebuffer when something changes (**dirty-frame**): camera input, resize, HUD-driven reload, backend/density changes, etc. Each redraw:
 
-1. `rasterize::project(&splats, &camera)` projects every splat in parallel with rayon. For each splat it builds the 3D covariance from `R * S * S^T * R^T`, rotates it into view space, applies the Jacobian of the pinhole projection to get the 2D image-plane covariance, adds a `0.3` low-pass dilation to the diagonal, computes a 3 sigma axis-aligned bbox, and clips the bbox to the framebuffer. View space is right-handed with the camera looking down `-z`; everything downstream uses `zc = -p_view.z` so depth is positive in front.
-2. `rasterize::sort_by_depth(&mut projected)` sorts by `zc` ascending (front-to-back) using `sort_unstable_by`.
-3. `rasterize::composite(&projected, &mut fb, w, h)` walks each projected splat's bbox in front-to-back order and does per-pixel alpha accumulation into a `(Vec3, f32)` framebuffer, with an early-out at `accum_alpha >= 0.999`.
-4. `framebuffer::render_halfblocks(&fb, w, h, &mut out)` converts the RGB framebuffer into a single `String` of half-block escapes. Each terminal cell holds two stacked pixels using the U+2580 character with top pixel as fg and bottom pixel as bg.
-5. `main` appends the FPS overlay to the same string and emits the whole frame with one `stdout().lock().write_all(...)` plus `flush`. Cursor is homed with `\x1b[H` at the top of the frame; the screen is never cleared.
+1. **Zero** the `(Vec3, f32)` framebuffer (premultiplied-style accumulation: RGB sum and transmittance-related alpha channel per pixel).
+2. **`rasterize::project`** — parallel over splats (rayon; optional dedicated `ThreadPool` from HUD). Builds `Projected` with screen position, depth `zc`, inverse 2D covariance, **axis-aligned bbox** clipped to the image. Bbox uses **opacity-aware extent** (FlashGS-style: effective radius from `2 ln(opacity / α_threshold)` capped by `extend_sigma`, combined with per-axis √Σᵢᵢ), **Jacobian structured** 2D covariance (same sign convention as before: matched flips for screen-up), and tunable **`RenderParams`** (`eps2d`, `alpha_threshold`, `extend_sigma`, `saturation`).
+3. **`rasterize::sort_by_depth_parallel`** — for large inputs with a thread pool, may use **parallel unstable sort** on `depth.to_bits()`; otherwise **`sort_by_depth`**: **2-pass 16-bit radix** sort on float bits using reusable **`ScratchBuffers.sort_aux`** (no per-frame alloc once grown).
+4. **`rasterize::composite_parallel`** — **`bin_splats`** builds **16×16 tile** index lists (counts + prefix sum + scatter, preserves front-to-back order per tile), then **`composite_tiled`** runs **rayon over tiles**; each tile only iterates splats overlapping that tile, writing through a **disjoint** pixel rect (raw-pointer writes documented in code). Uses a **fast approximate `exp`** for Gaussian alpha. Serial **`composite`** (same math, no tiles) remains for **deterministic regression** reference.
+5. **`Display::render`** — half-block string and/or Kitty graphics into the frame buffer string; FPS and **`HudState::render`** append overlays.
+6. **One `write_all` + `flush`** per emitted frame.
 
-### Modules
+The event loop uses **`event::poll(Duration::from_millis(33))`** when idle so the process does not busy-spin waiting for keys, while still draining bursts quickly.
 
-- `splat.rs`: `Splat { pos, scale, rot, color, opacity }`. `load_ply` does all decoding at load time: `exp()` on log-space scales, wxyz to xyzw quaternion reorder for `glam::Quat::from_xyzw`, SH band-0 to RGB via `sh::sh_band0_to_rgb`, sigmoid on the raw opacity logit. Nothing in this struct needs per-frame work. `downsample_uniform` is a stride-based subsample.
-- `camera.rs`: `OrbitCamera` with `target`, `yaw`, `pitch`, `radius`, `fov_y`, pixel `width`/`height`, `znear`, `zfar`. `view()` is `Mat4::look_at_rh`. `intrinsics()` returns `(fx, fy, cx, cy)` with `fx == fy` because half-block pixels are approximately square.
-- `rasterize.rs`: projection plus composite. The Jacobian has a sign flip on its second row (and a matching `-` in the v projection formula) so that world-up maps to screen-up on the y-down framebuffer. If the scene ever renders upside-down, remove both sign flips together; never just one, that breaks the covariance.
-- `framebuffer.rs`: the only place that writes SGR escapes. One `String`, truecolor fg plus bg in a single SGR sequence per cell, explicit `\r\n` plus SGR reset between rows in raw mode.
-- `main.rs`: `TerminalGuard` is an RAII type that enters alt-screen plus raw mode on construction and restores on `Drop`, so a panic cannot leave the shell broken. The event loop polls with `Duration::from_millis(0)` so rendering is never blocked on input. On startup the camera is auto-framed from the scene bounding box.
+### Modules (concise)
+
+- **`splat.rs`:** `Splat { pos, scale, rot, color, opacity }` — all linearized at load. `load_ply`, `downsample_uniform`. **`random_scene(n, seed, bounds)`** + **`Rng`**: deterministic synthetic scenes for tests and `bench_forward`.
+- **`camera.rs`:** `OrbitCamera` — `view()`, `intrinsics()` (`fx == fy`), `orbit`, `pan`, `zoom`, `resize`.
+- **`rasterize.rs`:** **`RenderParams`**, **`ScratchBuffers`**, **`Projected`**, **`TileBins`**, **`build_thread_pool`**, **`project`**, **`sort_by_depth`**, **`sort_by_depth_parallel`**, **`composite`**, **`composite_parallel`**, **`composite_tiled`**, **`bin_splats`**. Row-level skips in the tiled splat inner loop use the **peak along dx** of the 1D quadratic (not only `dx = 0`) so early-outs stay conservative vs serial.
+- **`framebuffer.rs`:** Half-block ANSI: precomputed byte tables, cursor-home prefix; primary SGR escape writer for that backend.
+- **`display.rs`:** Backend enum, Kitty probe, cell size, framebuffer dimensions, **`render` / `flush` / `overlay_string`**, resize and text-clear helpers used when switching Kitty/HUD.
+- **`hud.rs`:** **`HudState`**: max splats, sigmoid reload, **thread count**, backend, pixel density, FOV, **translate / rotation / zoom** speeds, live **`RenderParams`** sliders. Emits **`HudAction`** for `main` to reload PLY, resize FB, sync FOV, etc.
+- **`main.rs`:** **`TerminalGuard`** (raw + alt screen + mouse capture, restore on `Drop`). CLI with clap. Wires camera, HUD, display, thread pool, scratch buffers.
 
 ## Reference code
 
 `LichtFeld-Studio/` is a C++ 3DGS implementation included as a git submodule for reference. Useful anchor points when something looks wrong:
 
-- `src/io/formats/ply.cpp` and `src/io/formats/ply.hpp`: INRIA .ply field layout, including the fact that `scale_*` is log-space.
-- `src/rendering/rasterizer/gsplat_fwd/ProjectionUT3DGSFused.cu`: reference projection. Note that LichtFeld uses an Unscented Transform rather than the Jacobian approach we use here. The plan intentionally picks the simpler Jacobian form from the original 3DGS paper.
+- `src/io/formats/ply.cpp` and `src/io/formats/ply.hpp`: INRIA `.ply` field layout, including log-space scales.
+- `src/rendering/rasterizer/gsplat_fwd/ProjectionUT3DGSFused.cu`: reference projection (Unscented Transform there; this repo uses the Jacobian / 3DGS-paper style).
 - `src/rendering/rasterizer/gsplat_fwd/Cameras.cuh`: 3D covariance construction.
-- `src/rendering/rasterizer/gsplat_fwd/Utils.cuh`: `eps2d = 0.3` low-pass dilation constant.
-- `src/rendering/rasterizer/gsplat_fwd/Common.h`: `ALPHA_THRESHOLD = 1/255`.
+- `src/rendering/rasterizer/gsplat_fwd/Utils.cuh`: `eps2d` low-pass dilation (default `0.3` here, tunable in HUD).
+- `src/rendering/rasterizer/gsplat_fwd/Common.h`: `ALPHA_THRESHOLD` (default `1/255` here via `RenderParams`).
 
 Do not modify anything inside `LichtFeld-Studio/`.
 
-## Source of truth for scope
+## Plans vs reality
 
-`docs/plan/plan.md` is the authoritative implementation plan for the weekend MVP. Everything past that file's explicit "out of scope" list (tile rasterization, SIMD, higher SH bands, Kitty or Sixel, RLE ANSI compression, radix sort depth, parallel composite, bundled sample scene) is a follow-up, not an MVP gap.
-
-`docs/agents/handoff/` contains per-session handoff notes. Read the most recent one before picking up work.
+`docs/plan/plan.md` describes the **original MVP** and what was explicitly deferred then. The **current codebase implements several former follow-ups** (tile-based composite scheduling, radix depth sort, parallel compositing, Kitty backend, synthetic scenes for CI-style tests). Treat **`docs/agents/handoff/`** as the running lab notebook for **why** recent choices were made; treat **`plan.md`** as historical product intent unless someone updates it deliberately.
 
 ## Conventions and gotchas
 
-- **One write per frame.** Flushing stdout per cell is the real latency killer. Always append to the frame string and emit the whole thing in one `write_all`.
-- **Decode once at load time.** `exp` on scales, sigmoid on opacity, SH to RGB, quaternion normalize. None of these belong in the per-frame path.
-- **INRIA quaternion order is wxyz.** `rot_0` is w and `rot_1..3` are xyz. `glam::Quat::from_xyzw` wants xyzw, so the call is `Quat::from_xyzw(rx, ry, rz, rw)`. Getting this wrong produces silently-rotated splats.
-- **View space is right-handed.** Points in front of the camera have `p_view.z < 0`. Use `zc = -p_view.z` for the Jacobian and the depth sort key.
-- **Terminal cell aspect.** Half-block pixels are roughly square because a cell is ~2:1 tall and holds 2 pixels vertically. Treat `fx == fy`.
-- **Restore the terminal on panic.** Raw-mode setup is behind a `Drop` guard in `main.rs`. Do not bypass it.
-- **Sort stability does not matter here.** Use `sort_unstable_by`. This is the hot loop.
-- **glam, not nalgebra.** Graphics math is meaningfully faster in glam.
+- **One write per frame.** Keep terminal output batched; avoid per-cell flushes.
+- **Decode once at load time.** No `exp`/sigmoid/SH in the per-splat raster hot path beyond what is already baked into `Splat` / `Projected`.
+- **INRIA quaternion order is wxyz.** `Quat::from_xyzw(rx, ry, rz, rw)` after reordering from PLY.
+- **View space is right-handed** with the camera looking down **`-z`**. Use **`zc = -p_view.z`** for depth and the Jacobian.
+- **Terminal cell aspect.** Half-block path assumes roughly square pixels (`fx == fy`). Kitty path uses queried cell pixel size.
+- **Restore the terminal on panic.** Always go through **`TerminalGuard`** for raw mode.
+- **Sort stability** does not matter; parallel and radix paths use **unstable** ordering. **Parallel vs serial composite** can differ at the **1e-5–1e-2** level on some pixels due to **tile order** and **FP reordering**; regression tests allow a **loose tolerance** on RGB/alpha while enforcing broad equivalence.
+- **glam, not nalgebra.**
 
-## Out of scope right now
+## Reasonable follow-ups (not implemented)
 
-Tile rasterization, SIMD (`wide` or nightly `std::simd`), SH bands beyond band 0, Kitty or Sixel graphics backends, RLE ANSI compression, radix-sort depth, per-pixel parallel composite, bundled sample scene, `cargo install` distribution, asciinema recording. Every one of these is a reasonable follow-up, but none of them belong in the MVP.
+SIMD (`wide` / `std::simd`), **spherical harmonics beyond band 0**, **Sixel** or other bitmap protocols, **RLE / compressed ANSI**, **bundled sample `.ply`**, **`cargo install` / packaging**, **asciinema** tooling. Any of these would be new scope rather than “finishing the MVP.”

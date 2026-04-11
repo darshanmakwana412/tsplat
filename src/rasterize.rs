@@ -8,12 +8,129 @@ use crate::splat::Splat;
 pub struct ScratchBuffers {
     /// Aux buffer for radix sort ping-pong.
     pub sort_aux: Vec<Projected>,
+    /// Tile binning storage (reused across frames).
+    pub tiles: TileBins,
 }
 
 impl ScratchBuffers {
     pub fn new() -> Self {
         Self {
             sort_aux: Vec::new(),
+            tiles: TileBins::new(),
+        }
+    }
+}
+
+/// Pixel dimensions of a composite tile. 16×16 gives ~35 tiles at 120×80 and
+/// ~75 tiles at 240×160, which is enough parallel work for 8–16 threads even
+/// on the small terminal.
+pub const TILE_W: i32 = 16;
+pub const TILE_H: i32 = 16;
+
+/// Per-tile splat list, scatter-built once per frame after the global depth
+/// sort. `offsets[i]..offsets[i+1]` is the index range into `splat_indices`
+/// for tile `i`; indices are ordered front-to-back because they were inserted
+/// in the same order as the sorted `projected` slice.
+pub struct TileBins {
+    pub num_tiles_x: i32,
+    pub num_tiles_y: i32,
+    pub offsets: Vec<u32>,
+    pub splat_indices: Vec<u32>,
+    /// Per-tile cursor used during scatter; reused to avoid reallocation.
+    cursor: Vec<u32>,
+}
+
+impl TileBins {
+    pub fn new() -> Self {
+        Self {
+            num_tiles_x: 0,
+            num_tiles_y: 0,
+            offsets: Vec::new(),
+            splat_indices: Vec::new(),
+            cursor: Vec::new(),
+        }
+    }
+
+    #[inline]
+    pub fn num_tiles(&self) -> usize {
+        (self.num_tiles_x * self.num_tiles_y) as usize
+    }
+}
+
+/// Scatter projected splats into per-tile index lists. Two passes:
+/// 1. For each splat, bump the per-tile count for every tile its bbox touches.
+/// 2. Prefix-sum → offsets. Second pass scatters splat indices using a cursor
+///    vec so each tile's bucket ends up depth-sorted (input order is preserved).
+pub fn bin_splats(
+    projected: &[Projected],
+    width: u32,
+    height: u32,
+    bins: &mut TileBins,
+) {
+    let num_tiles_x = ((width as i32) + TILE_W - 1) / TILE_W;
+    let num_tiles_y = ((height as i32) + TILE_H - 1) / TILE_H;
+    let num_tiles = (num_tiles_x * num_tiles_y) as usize;
+    bins.num_tiles_x = num_tiles_x;
+    bins.num_tiles_y = num_tiles_y;
+
+    // offsets is used first as a count array, then prefix-summed in place.
+    bins.offsets.clear();
+    bins.offsets.resize(num_tiles + 1, 0);
+
+    // Pass 1: count tile touches per splat.
+    for p in projected {
+        let [x0, y0, x1, y1] = p.bbox;
+        let tx0 = (x0 / TILE_W).max(0);
+        let ty0 = (y0 / TILE_H).max(0);
+        let tx1 = (x1 / TILE_W).min(num_tiles_x - 1);
+        let ty1 = (y1 / TILE_H).min(num_tiles_y - 1);
+        if tx0 > tx1 || ty0 > ty1 {
+            continue;
+        }
+        for ty in ty0..=ty1 {
+            let row = (ty * num_tiles_x) as usize;
+            for tx in tx0..=tx1 {
+                // offsets[i+1] eventually becomes the cumulative count up to and
+                // including tile i, so bumping index `row + tx + 1` here means
+                // a plain in-place prefix sum lands offsets[i] on the *start*
+                // of bucket i.
+                bins.offsets[row + tx as usize + 1] += 1;
+            }
+        }
+    }
+
+    // Prefix sum: offsets[i] = start of bucket i.
+    for i in 1..=num_tiles {
+        bins.offsets[i] += bins.offsets[i - 1];
+    }
+    let total = bins.offsets[num_tiles] as usize;
+
+    bins.splat_indices.clear();
+    bins.splat_indices.resize(total, 0);
+
+    // Cursor starts at each bucket's begin and advances as we scatter.
+    bins.cursor.clear();
+    bins.cursor.extend_from_slice(&bins.offsets[..num_tiles]);
+
+    // Pass 2: scatter splat indices into their tile buckets, preserving the
+    // front-to-back order of `projected` inside each bucket.
+    for (idx, p) in projected.iter().enumerate() {
+        let [x0, y0, x1, y1] = p.bbox;
+        let tx0 = (x0 / TILE_W).max(0);
+        let ty0 = (y0 / TILE_H).max(0);
+        let tx1 = (x1 / TILE_W).min(num_tiles_x - 1);
+        let ty1 = (y1 / TILE_H).min(num_tiles_y - 1);
+        if tx0 > tx1 || ty0 > ty1 {
+            continue;
+        }
+        for ty in ty0..=ty1 {
+            let row = (ty * num_tiles_x) as usize;
+            for tx in tx0..=tx1 {
+                let tile = row + tx as usize;
+                let pos = bins.cursor[tile] as usize;
+                bins.splat_indices[pos] = idx as u32;
+                bins.cursor[tile] += 1;
+            }
         }
     }
 }
@@ -85,7 +202,12 @@ pub fn project(
     let zfar = camera.zfar;
     let w_mat_t = w_mat.transpose();
     let eps2d = params.eps2d;
-    let extend_sigma = params.extend_sigma;
+    // FlashGS Eq 3: the classic 3σ rule becomes `k² ≤ max_k2` where
+    // `max_k2 = extend_sigma²`. Opacity-aware cutoff clamps k² below this when
+    // the gaussian is faint enough that the per-pixel alpha hits the threshold
+    // sooner. Precomputed once per frame.
+    let max_k2 = params.extend_sigma * params.extend_sigma;
+    let alpha_threshold = params.alpha_threshold;
 
     let do_project = || {
         splats
@@ -149,14 +271,28 @@ pub fn project(
                     return None;
                 }
 
-                // Largest eigenvalue → 3σ bbox radius.
-                let mid = 0.5 * (cov2d_00 + cov2d_11);
-                let lambda1 = mid + (mid * mid - det).max(0.01).sqrt();
-                let radius_f = extend_sigma * lambda1.sqrt();
-                if !radius_f.is_finite() || radius_f < 1.0 {
+                // FlashGS Eq 3: opacity-aware cutoff. A pixel is worth writing
+                // while `alpha = opacity * exp(-0.5 * dᵀΣ⁻¹d) >= τ`, which
+                // rearranges to `dᵀΣ⁻¹d <= k²` with `k² = 2 ln(opacity/τ)`.
+                // Clamp at the classic 3σ so near-opaque splats don't balloon.
+                if s.opacity <= alpha_threshold {
                     return None;
                 }
-                let radius = radius_f.ceil() as i32;
+                let k2 = (2.0 * (s.opacity / alpha_threshold).ln()).min(max_k2);
+                if !(k2 > 0.0) {
+                    return None;
+                }
+
+                // Tight per-axis ellipse AABB: `|dx|_max = k·√Σ₀₀`,
+                // `|dy|_max = k·√Σ₁₁`. This is much smaller than the old
+                // circumscribed-circle bbox (`k·√λ_max` on both axes) whenever
+                // the projected ellipse is elongated — which is the common
+                // case for grazing-angle splats.
+                let rx_f = (k2 * cov2d_00).sqrt();
+                let ry_f = (k2 * cov2d_11).sqrt();
+                if !rx_f.is_finite() || !ry_f.is_finite() || rx_f < 1.0 || ry_f < 1.0 {
+                    return None;
+                }
 
                 // Invert 2x2 directly (avoid Mat2::inverse overhead).
                 let inv_det = 1.0 / det;
@@ -169,10 +305,10 @@ pub fn project(
                 let sx = fx * xv * inv_zc + cx;
                 let sy = fy * yv * inv_zc + cy;
 
-                let x0 = (sx - radius as f32).floor() as i32;
-                let y0 = (sy - radius as f32).floor() as i32;
-                let x1 = (sx + radius as f32).ceil() as i32;
-                let y1 = (sy + radius as f32).ceil() as i32;
+                let x0 = (sx - rx_f).floor() as i32;
+                let y0 = (sy - ry_f).floor() as i32;
+                let x1 = (sx + rx_f).ceil() as i32;
+                let y1 = (sy + ry_f).ceil() as i32;
 
                 // Clip to framebuffer.
                 let x0 = x0.max(0);
@@ -199,6 +335,27 @@ pub fn project(
         Some(p) => p.install(do_project),
         None => do_project(),
     }
+}
+
+/// Parallel front-to-back sort. Falls back to the serial radix sort for
+/// single-threaded callers; otherwise uses rayon's parallel pattern-defeating
+/// quicksort keyed on bitcast u32 depth. At 200k splats the parallel path is
+/// measurably faster than the serial radix sort once you have 4+ threads.
+pub fn sort_by_depth_parallel(
+    projected: &mut [Projected],
+    scratch: &mut ScratchBuffers,
+    pool: &Option<rayon::ThreadPool>,
+) {
+    if projected.len() < 50_000 || pool.is_none() {
+        // Thread-pool overhead isn't worth it for small inputs.
+        sort_by_depth(projected, scratch);
+        return;
+    }
+    // Depth is positive in front, so raw bit pattern preserves float order
+    // and we can sort on `to_bits()` as a plain u32 key.
+    pool.as_ref().unwrap().install(|| {
+        projected.par_sort_unstable_by_key(|p| p.depth.to_bits());
+    });
 }
 
 /// Sort front-to-back using a 2-pass 16-bit radix sort on bitcast u32 depth
@@ -260,9 +417,12 @@ pub fn sort_by_depth(projected: &mut [Projected], scratch: &mut ScratchBuffers) 
 }
 
 /// Front-to-back alpha composite into the RGB framebuffer (single-threaded).
+/// Used by the regression tests as a deterministic reference; the interactive
+/// viewer uses `composite_parallel`.
 ///
 /// `fb` is a packed `(rgb, accum_alpha)` buffer of length `width * height`,
 /// assumed to be zeroed at the start of each frame.
+#[allow(dead_code)]
 pub fn composite(projected: &[Projected], fb: &mut [(Vec3, f32)], width: u32, _height: u32, params: &RenderParams) {
     let w = width as usize;
     for p in projected {
@@ -284,6 +444,7 @@ pub fn composite(projected: &[Projected], fb: &mut [(Vec3, f32)], width: u32, _h
 ///
 /// Then: power = dx_coeff * dx² + row_slope * dx + row_base
 #[inline]
+#[allow(dead_code)]
 fn composite_splat(p: &Projected, fb: &mut [(Vec3, f32)], w: usize, params: &RenderParams) {
     let [x0, y0, x1, y1] = p.bbox;
 
@@ -333,9 +494,6 @@ fn composite_splat(p: &Projected, fb: &mut [(Vec3, f32)], w: usize, params: &Ren
     }
 }
 
-/// Height in pixels of each horizontal tile for parallel composite.
-const TILE_HEIGHT: usize = 16;
-
 /// Build a rayon thread pool with the given number of threads.
 /// Returns `None` for 0 (use rayon global pool).
 pub fn build_thread_pool(num_threads: usize) -> Option<rayon::ThreadPool> {
@@ -351,12 +509,39 @@ pub fn build_thread_pool(num_threads: usize) -> Option<rayon::ThreadPool> {
     }
 }
 
-/// Front-to-back alpha composite into the RGB framebuffer, parallelised over
-/// horizontal tiles. Each tile owns a disjoint slice of the framebuffer so
-/// there are no data races. Pass a pre-built thread pool to avoid per-frame
-/// allocation overhead (use `build_thread_pool`).
+/// Send+Sync wrapper around a raw framebuffer pointer. Each composite tile
+/// writes to a *disjoint* pixel rect (guaranteed by 2D tile geometry), so we
+/// escape Rust's aliasing rules with a bare pointer and a `for_each` that
+/// never lets two threads hit the same cell.
+#[derive(Clone, Copy)]
+struct FbPtr(*mut (Vec3, f32));
+unsafe impl Send for FbPtr {}
+unsafe impl Sync for FbPtr {}
+
+/// Convenience wrapper: bin + parallel composite in one call. Most callers
+/// should use this; the bench splits them to time each stage independently.
 pub fn composite_parallel(
     projected: &[Projected],
+    fb: &mut [(Vec3, f32)],
+    width: u32,
+    height: u32,
+    params: &RenderParams,
+    scratch: &mut ScratchBuffers,
+    pool: &Option<rayon::ThreadPool>,
+) {
+    bin_splats(projected, width, height, &mut scratch.tiles);
+    composite_tiled(projected, &scratch.tiles, fb, width, height, params, pool);
+}
+
+/// Front-to-back alpha composite into the RGB framebuffer, parallelised over
+/// 2D pixel tiles using a pre-built tile binning. Each tile iterates only the
+/// splats whose bbox actually touches it, rather than scanning the whole
+/// projected list — this changes composite from `O(tiles · splats)` work
+/// back down to `O(visible pixel work)`. Raw-pointer writes give every tile
+/// its own disjoint pixel range without violating `&mut` aliasing.
+pub fn composite_tiled(
+    projected: &[Projected],
+    bins: &TileBins,
     fb: &mut [(Vec3, f32)],
     width: u32,
     height: u32,
@@ -364,85 +549,124 @@ pub fn composite_parallel(
     pool: &Option<rayon::ThreadPool>,
 ) {
     let w = width as usize;
-    let h = height as usize;
+    let h_i = height as i32;
+    let w_i = width as i32;
+    let num_tiles_x = bins.num_tiles_x;
+    let num_tiles = bins.num_tiles();
+    let fb_ptr = FbPtr(fb.as_mut_ptr());
 
-    let do_composite = |fb: &mut [(Vec3, f32)]| {
-        // Split fb into tile-sized chunks and process in parallel.
-        let tile_stride = TILE_HEIGHT * w;
-        fb.par_chunks_mut(tile_stride)
-            .enumerate()
-            .for_each(|(tile_idx, tile_fb)| {
-                let tile_y0 = (tile_idx * TILE_HEIGHT) as i32;
-                let tile_y1 = (tile_y0 + tile_fb.len() as i32 / w as i32 - 1).min(h as i32 - 1);
+    let do_composite = || {
+        (0..num_tiles).into_par_iter().for_each(move |tile_idx| {
+            // Force-capture the FbPtr wrapper (not just the inner raw pointer)
+            // so the compiler sees our Send/Sync impls. Without this binding,
+            // Rust 2021 disjoint capture takes only `fb_ptr.0` which is a bare
+            // `*mut` and fails the closure's Send+Sync bounds.
+            let fbp = fb_ptr;
+            let tile_x = (tile_idx as i32) % num_tiles_x;
+            let tile_y = (tile_idx as i32) / num_tiles_x;
+            let px0 = tile_x * TILE_W;
+            let py0 = tile_y * TILE_H;
+            let px1 = (px0 + TILE_W - 1).min(w_i - 1);
+            let py1 = (py0 + TILE_H - 1).min(h_i - 1);
+            if px0 > px1 || py0 > py1 {
+                return;
+            }
 
-                for p in projected {
-                    let [x0, y0, x1, y1] = p.bbox;
-                    // Skip splats that don't overlap this tile.
-                    if y1 < tile_y0 || y0 > tile_y1 {
-                        continue;
-                    }
-                    // Clamp to tile bounds.
-                    let py_start = y0.max(tile_y0);
-                    let py_end = y1.min(tile_y1);
+            let start = bins.offsets[tile_idx] as usize;
+            let end = bins.offsets[tile_idx + 1] as usize;
+            if start == end {
+                return;
+            }
+            let splat_ids = &bins.splat_indices[start..end];
 
-                    // ILP: hoist row-invariant terms out of the inner loop.
-                    let a = p.cov2d_inv.x_axis.x;
-                    let b = p.cov2d_inv.x_axis.y;
-                    let d = p.cov2d_inv.y_axis.y;
-                    let dx_coeff = -0.5 * a;
-                    let dy_coeff = -0.5 * d;
-                    let cross_coeff = -b;
-                    let saturation = params.saturation;
-                    let alpha_threshold = params.alpha_threshold;
-                    let opacity = p.opacity;
-                    let color = p.color;
-
-                    // Pre-compute the row_base threshold: if the dy² term alone
-                    // makes alpha negligible, skip the entire row.
-                    // opacity * exp(row_base) < alpha_threshold
-                    // row_base < ln(alpha_threshold / opacity)
-                    let row_base_cutoff = (alpha_threshold / opacity).ln();
-
-                    for py in py_start..=py_end {
-                        let dy = py as f32 - p.screen.y;
-                        let row_base = dy_coeff * dy * dy;
-
-                        // Early-out: if the Gaussian's dy² term alone is too
-                        // small, no pixel on this row can contribute.
-                        if row_base < row_base_cutoff {
-                            continue;
-                        }
-
-                        let row_slope = cross_coeff * dy;
-                        let local_row = (py - tile_y0) as usize * w;
-
-                        for px in x0..=x1 {
-                            let idx = local_row + px as usize;
-                            let cell = &mut tile_fb[idx];
-                            if cell.1 >= saturation {
-                                continue;
-                            }
-                            let dx = px as f32 - p.screen.x;
-                            let power = dx_coeff * dx * dx + row_slope * dx + row_base;
-                            if power > 0.0 {
-                                continue;
-                            }
-                            let alpha = (opacity * fast_exp(power)).min(0.999);
-                            if alpha < alpha_threshold {
-                                continue;
-                            }
-                            let t = 1.0 - cell.1;
-                            let contrib = t * alpha;
-                            cell.0 += contrib * color;
-                            cell.1 += contrib;
-                        }
-                    }
+            for &sid in splat_ids {
+                let p = unsafe { projected.get_unchecked(sid as usize) };
+                let [bx0, by0, bx1, by1] = p.bbox;
+                let x0 = bx0.max(px0);
+                let y0 = by0.max(py0);
+                let x1 = bx1.min(px1);
+                let y1 = by1.min(py1);
+                if x0 > x1 || y0 > y1 {
+                    continue;
                 }
-            });
+                // SAFETY: (x0..=x1, y0..=y1) ⊂ this tile's exclusive pixel
+                // rect; no other rayon task writes here.
+                unsafe {
+                    composite_splat_region(p, fbp.0, w, x0, y0, x1, y1, params);
+                }
+            }
+        });
     };
 
     match pool.as_ref() {
-        Some(p) => p.install(|| do_composite(fb)),
-        None => do_composite(fb),
+        Some(p) => p.install(do_composite),
+        None => do_composite(),
+    }
+}
+
+/// Composite a single splat into a tile-local pixel rectangle via raw-pointer
+/// writes. Shared by the tiled parallel compositor; the same ILP hoists as
+/// `composite_splat` are preserved here.
+#[inline]
+unsafe fn composite_splat_region(
+    p: &Projected,
+    fb_ptr: *mut (Vec3, f32),
+    w: usize,
+    x0: i32,
+    y0: i32,
+    x1: i32,
+    y1: i32,
+    params: &RenderParams,
+) {
+    let a = p.cov2d_inv.x_axis.x;
+    let b = p.cov2d_inv.x_axis.y;
+    let d = p.cov2d_inv.y_axis.y;
+    let dx_coeff = -0.5 * a;
+    let dy_coeff = -0.5 * d;
+    let cross_coeff = -b;
+
+    let saturation = params.saturation;
+    let alpha_threshold = params.alpha_threshold;
+    let opacity = p.opacity;
+    let color = p.color;
+    let sx = p.screen.x;
+    let sy = p.screen.y;
+
+    // Row-level early-out: peak of the 1D quadratic in dx is at the vertex of
+    // power(dx)=dx_coeff*dx²+row_slope*dx+row_base (dx_coeff<0). Using row_base
+    // alone would miss off-center peaks and could skip visible rows.
+    let row_peak_cutoff = (alpha_threshold / opacity).ln();
+    let inv_a = 1.0 / a;
+
+    for py in y0..=y1 {
+        let dy = py as f32 - sy;
+        let row_base = dy_coeff * dy * dy;
+        let row_slope = cross_coeff * dy;
+        let row_peak = row_base + 0.5 * row_slope * row_slope * inv_a;
+        if row_peak < row_peak_cutoff {
+            continue;
+        }
+        let row_offset = py as usize * w;
+
+        for px in x0..=x1 {
+            let idx = row_offset + px as usize;
+            let cell = unsafe { &mut *fb_ptr.add(idx) };
+            if cell.1 >= saturation {
+                continue;
+            }
+            let dx = px as f32 - sx;
+            let power = dx_coeff * dx * dx + row_slope * dx + row_base;
+            if power > 0.0 {
+                continue;
+            }
+            let alpha = (opacity * fast_exp(power)).min(0.999);
+            if alpha < alpha_threshold {
+                continue;
+            }
+            let t = 1.0 - cell.1;
+            let contrib = t * alpha;
+            cell.0 += contrib * color;
+            cell.1 += contrib;
+        }
     }
 }

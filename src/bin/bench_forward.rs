@@ -1,12 +1,15 @@
-//! Standalone forward-pass benchmark with detailed per-stage statistics.
+//! Synthetic-scene forward-pass benchmark with detailed per-stage stats and
+//! thread-scaling sweep.
 //!
-//! Runs the full pipeline N times with fixed camera parameters from the HUD
-//! screenshot and reports timing stats for each stage.
+//! By default loads a deterministic random gaussian scene (no .ply needed) and
+//! runs the full pipeline for N frames per configured thread count, printing
+//! per-stage mean/min/max/p50/p95/p99 in microseconds and a scaling table.
 //!
 //! Usage:
 //!   cargo run --release --bin bench_forward
-//!   cargo run --release --bin bench_forward -- --frames 200 --max-splats 500000
-//!   cargo run --release --bin bench_forward -- --width 240 --height 160
+//!   cargo run --release --bin bench_forward -- --frames 200 --splats 500000
+//!   cargo run --release --bin bench_forward -- --threads 1,2,4,8,16
+//!   cargo run --release --bin bench_forward -- --ply path/to/scene.ply
 
 use std::path::PathBuf;
 use std::time::Instant;
@@ -15,40 +18,34 @@ use glam::Vec3;
 
 use tsplat::camera::OrbitCamera;
 use tsplat::framebuffer::render_halfblocks;
-use tsplat::rasterize::{RenderParams, ScratchBuffers, build_thread_pool, composite_parallel, project, sort_by_depth};
-use tsplat::splat::load_ply;
-
-fn scene_path() -> PathBuf {
-    let local = PathBuf::from("data/garden/point_cloud.ply");
-    if local.exists() {
-        return local;
-    }
-    let home = PathBuf::from(std::env::var("HOME").unwrap_or_default())
-        .join("datasets/3dgs/garden.ply");
-    if home.exists() {
-        return home;
-    }
-    panic!(
-        "No garden scene found. Expected at data/garden/point_cloud.ply or ~/datasets/3dgs/garden.ply"
-    );
-}
+use tsplat::rasterize::{
+    RenderParams, ScratchBuffers, build_thread_pool, composite_parallel, project,
+    sort_by_depth_parallel,
+};
+use tsplat::splat::{Splat, load_ply, random_scene};
 
 struct BenchArgs {
     frames: usize,
-    max_splats: usize,
+    warmup: usize,
+    splats: usize,
     width: u32,
     height: u32,
-    warmup: usize,
+    threads: Vec<usize>,
+    seed: u64,
+    ply: Option<PathBuf>,
 }
 
 impl Default for BenchArgs {
     fn default() -> Self {
         Self {
-            frames: 100,
-            max_splats: 200_000,
+            frames: 120,
+            warmup: 10,
+            splats: 200_000,
             width: 120,
             height: 80,
-            warmup: 5,
+            threads: vec![1, 2, 4, 8],
+            seed: 0xC0FFEE,
+            ply: None,
         }
     }
 }
@@ -59,192 +56,224 @@ fn parse_args() -> BenchArgs {
     let mut i = 1;
     while i < raw.len() {
         match raw[i].as_str() {
-            "--frames" | "-n" => {
+            "--frames" | "-n" => { i += 1; args.frames = raw[i].parse().expect("invalid --frames"); }
+            "--warmup" => { i += 1; args.warmup = raw[i].parse().expect("invalid --warmup"); }
+            "--splats" | "--max-splats" => { i += 1; args.splats = raw[i].parse().expect("invalid --splats"); }
+            "--width" => { i += 1; args.width = raw[i].parse().expect("invalid --width"); }
+            "--height" => { i += 1; args.height = raw[i].parse().expect("invalid --height"); }
+            "--seed" => { i += 1; args.seed = raw[i].parse().expect("invalid --seed"); }
+            "--threads" => {
                 i += 1;
-                args.frames = raw[i].parse().expect("invalid --frames");
+                args.threads = raw[i]
+                    .split(',')
+                    .map(|s| s.trim().parse().expect("invalid thread count"))
+                    .collect();
             }
-            "--max-splats" => {
-                i += 1;
-                args.max_splats = raw[i].parse().expect("invalid --max-splats");
-            }
-            "--width" => {
-                i += 1;
-                args.width = raw[i].parse().expect("invalid --width");
-            }
-            "--height" => {
-                i += 1;
-                args.height = raw[i].parse().expect("invalid --height");
-            }
-            "--warmup" => {
-                i += 1;
-                args.warmup = raw[i].parse().expect("invalid --warmup");
-            }
+            "--ply" => { i += 1; args.ply = Some(PathBuf::from(&raw[i])); }
             "--help" | "-h" => {
                 eprintln!("Usage: bench_forward [OPTIONS]");
-                eprintln!("  --frames N       Number of frames to benchmark (default: 100)");
-                eprintln!("  --max-splats N   Splat cap (default: 200000)");
+                eprintln!("  --frames N       Frames per thread setting (default: 120)");
+                eprintln!("  --warmup N       Warmup frames (default: 10)");
+                eprintln!("  --splats N       Number of synthetic gaussians (default: 200000)");
                 eprintln!("  --width W        Framebuffer width in pixels (default: 120)");
                 eprintln!("  --height H       Framebuffer height in pixels (default: 80)");
-                eprintln!("  --warmup N       Warmup frames (default: 5)");
+                eprintln!("  --seed S         Synthetic scene PRNG seed (default: 0xC0FFEE)");
+                eprintln!("  --threads LIST   Comma-separated thread sweep (default: 1,2,4,8)");
+                eprintln!("  --ply PATH       Use a real .ply scene instead of synthetic");
                 std::process::exit(0);
             }
-            other => {
-                eprintln!("Unknown argument: {other}. Use --help for usage.");
-                std::process::exit(1);
-            }
+            other => { eprintln!("Unknown argument: {other}. Use --help for usage."); std::process::exit(1); }
         }
         i += 1;
     }
     args
 }
 
+fn bench_camera(width: u32, height: u32) -> OrbitCamera {
+    let mut cam = OrbitCamera::new(width, height);
+    // Centered on the origin of the synthetic cube, far enough to see
+    // everything. Fov/pitch/yaw picked to stress projection across screen.
+    cam.target = Vec3::ZERO;
+    cam.yaw = 0.6;
+    cam.pitch = 0.35;
+    cam.radius = 55.0;
+    cam.fov_y = 55.0_f32.to_radians();
+    cam
+}
+
+fn load_scene(args: &BenchArgs) -> Vec<Splat> {
+    if let Some(path) = &args.ply {
+        let (splats, _) = load_ply(path, true, args.splats).expect("failed to load .ply");
+        splats
+    } else {
+        // 20-unit cube is a good match for a camera radius of 55 with 55° fov.
+        random_scene(args.splats, args.seed, 20.0)
+    }
+}
+
 #[derive(Default)]
 struct Timings {
-    project_us: Vec<f64>,
-    sort_us: Vec<f64>,
-    composite_us: Vec<f64>,
-    halfblocks_us: Vec<f64>,
-    total_us: Vec<f64>,
+    project: Vec<f64>,
+    sort: Vec<f64>,
+    composite: Vec<f64>,
+    halfblocks: Vec<f64>,
+    total: Vec<f64>,
 }
 
 fn percentile(sorted: &[f64], p: f64) -> f64 {
-    if sorted.is_empty() {
-        return 0.0;
-    }
+    if sorted.is_empty() { return 0.0; }
     let idx = (p / 100.0 * (sorted.len() - 1) as f64).round() as usize;
     sorted[idx.min(sorted.len() - 1)]
 }
 
-fn stats_line(label: &str, values: &mut Vec<f64>) {
+fn mean(v: &[f64]) -> f64 { v.iter().sum::<f64>() / v.len() as f64 }
+
+fn print_stats(label: &str, values: &mut Vec<f64>) {
     values.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let n = values.len() as f64;
-    let mean = values.iter().sum::<f64>() / n;
+    let m = mean(values);
     let min = values[0];
     let max = values[values.len() - 1];
     let p50 = percentile(values, 50.0);
     let p95 = percentile(values, 95.0);
     let p99 = percentile(values, 99.0);
-
     println!(
-        "  {:<16} {:>10.1} {:>10.1} {:>10.1} {:>10.1} {:>10.1} {:>10.1}",
-        label, mean, min, max, p50, p95, p99
+        "  {:<12} {:>10.1} {:>10.1} {:>10.1} {:>10.1} {:>10.1} {:>10.1}",
+        label, m, min, max, p50, p95, p99,
     );
 }
 
-fn main() {
-    let args = parse_args();
+struct RunResult {
+    threads: usize,
+    frames: usize,
+    total_mean_us: f64,
+    project_mean_us: f64,
+    sort_mean_us: f64,
+    composite_mean_us: f64,
+    halfblocks_mean_us: f64,
+    fps: f64,
+}
 
-    eprintln!("Loading scene...");
-    let (splats, _total) = load_ply(&scene_path(), true, args.max_splats).expect("failed to load scene");
-    eprintln!("Loaded {} splats", splats.len());
-
-    let mut camera = OrbitCamera::new(args.width, args.height);
-    camera.yaw = -0.080;
-    camera.pitch = 0.353;
-    camera.radius = 52.161;
-    camera.fov_y = 55.0_f32.to_radians();
-    camera.target = Vec3::new(4.14, -11.97, -38.58);
-
+fn run_one(threads: usize, splats: &[Splat], args: &BenchArgs) -> RunResult {
+    let camera = bench_camera(args.width, args.height);
     let params = RenderParams::default();
     let fb_size = (args.width * args.height) as usize;
     let mut fb = vec![(Vec3::ZERO, 0.0f32); fb_size];
     let mut out = String::with_capacity(256 * 1024);
-    let pool = build_thread_pool(4);
+    let pool = build_thread_pool(threads);
     let mut scratch = ScratchBuffers::new();
+
+    for _ in 0..args.warmup {
+        unsafe { std::ptr::write_bytes(fb.as_mut_ptr(), 0, fb.len()); }
+        let mut projected = project(splats, &camera, &params, &pool);
+        sort_by_depth_parallel(&mut projected, &mut scratch, &pool);
+        composite_parallel(&projected, &mut fb, args.width, args.height, &params, &mut scratch, &pool);
+        render_halfblocks(&fb, args.width, args.height, &mut out);
+    }
+
+    let mut t = Timings::default();
+    let wall_start = Instant::now();
+
+    for _ in 0..args.frames {
+        unsafe { std::ptr::write_bytes(fb.as_mut_ptr(), 0, fb.len()); }
+        let f0 = Instant::now();
+
+        let t0 = Instant::now();
+        let mut projected = project(splats, &camera, &params, &pool);
+        let t1 = Instant::now();
+
+        sort_by_depth_parallel(&mut projected, &mut scratch, &pool);
+        let t2 = Instant::now();
+
+        composite_parallel(&projected, &mut fb, args.width, args.height, &params, &mut scratch, &pool);
+        let t3 = Instant::now();
+
+        render_halfblocks(&fb, args.width, args.height, &mut out);
+        let t4 = Instant::now();
+
+        t.project.push((t1 - t0).as_micros() as f64);
+        t.sort.push((t2 - t1).as_micros() as f64);
+        t.composite.push((t3 - t2).as_micros() as f64);
+        t.halfblocks.push((t4 - t3).as_micros() as f64);
+        t.total.push((t4 - f0).as_micros() as f64);
+    }
+
+    let wall = wall_start.elapsed().as_secs_f64();
+
+    println!();
+    println!("=== threads = {} ===", threads);
+    println!(
+        "  {:<12} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10}",
+        "stage", "mean(us)", "min(us)", "max(us)", "p50(us)", "p95(us)", "p99(us)",
+    );
+    println!("  {}", "-".repeat(78));
+    print_stats("project", &mut t.project);
+    print_stats("sort", &mut t.sort);
+    print_stats("composite", &mut t.composite);
+    print_stats("halfblocks", &mut t.halfblocks);
+    println!("  {}", "-".repeat(78));
+    print_stats("TOTAL", &mut t.total);
+    println!("  wall={:.2}s  FPS={:.1}", wall, args.frames as f64 / wall);
+
+    RunResult {
+        threads,
+        frames: args.frames,
+        total_mean_us: mean(&t.total),
+        project_mean_us: mean(&t.project),
+        sort_mean_us: mean(&t.sort),
+        composite_mean_us: mean(&t.composite),
+        halfblocks_mean_us: mean(&t.halfblocks),
+        fps: args.frames as f64 / wall,
+    }
+}
+
+fn main() {
+    let args = parse_args();
+    let splats = load_scene(&args);
 
     println!();
     println!("=== tsplat forward-pass benchmark ===");
+    match &args.ply {
+        Some(p) => println!("  scene:      {} (real)", p.display()),
+        None => println!("  scene:      synthetic (seed=0x{:X})", args.seed),
+    }
     println!("  splats:     {}", splats.len());
-    println!("  resolution: {}x{} ({}x{} terminal cells)",
-        args.width, args.height, args.width, args.height / 2);
-    println!("  frames:     {} (+{} warmup)", args.frames, args.warmup);
-    println!();
+    println!(
+        "  resolution: {}x{} ({}x{} terminal cells)",
+        args.width, args.height, args.width, args.height / 2,
+    );
+    println!(
+        "  frames:     {} per config (+{} warmup)",
+        args.frames, args.warmup,
+    );
+    println!("  threads:    {:?}", args.threads);
 
-    // Warmup
-    for _ in 0..args.warmup {
-        // Fast zero-fill via memset.
-        unsafe { std::ptr::write_bytes(fb.as_mut_ptr(), 0, fb.len()); }
-        let mut projected = project(&splats, &camera, &params, &pool);
-        sort_by_depth(&mut projected, &mut scratch);
-        composite_parallel(&projected, &mut fb, args.width, args.height, &params, &pool);
-        render_halfblocks(&fb, args.width, args.height, &mut out);
+    let results: Vec<RunResult> = args
+        .threads
+        .iter()
+        .map(|&t| run_one(t, &splats, &args))
+        .collect();
+
+    println!();
+    println!("=== thread scaling summary ===");
+    println!(
+        "  {:>7} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10}",
+        "threads", "fps", "total_us", "proj", "sort", "comp", "halfbl",
+    );
+    println!("  {}", "-".repeat(72));
+    let baseline_fps = results.first().map(|r| r.fps).unwrap_or(1.0);
+    for r in &results {
+        println!(
+            "  {:>7} {:>10.1} {:>10.1} {:>10.1} {:>10.1} {:>10.1} {:>10.1}  ({:.2}x)",
+            r.threads,
+            r.fps,
+            r.total_mean_us,
+            r.project_mean_us,
+            r.sort_mean_us,
+            r.composite_mean_us,
+            r.halfblocks_mean_us,
+            r.fps / baseline_fps,
+        );
     }
-
-    let mut timings = Timings::default();
-
-    let bench_start = Instant::now();
-
-    for frame in 0..args.frames {
-        // Clear
-        // Fast zero-fill via memset.
-        unsafe { std::ptr::write_bytes(fb.as_mut_ptr(), 0, fb.len()); }
-
-        let frame_start = Instant::now();
-
-        // Project
-        let t0 = Instant::now();
-        let mut projected = project(&splats, &camera, &params, &pool);
-        let t1 = Instant::now();
-
-        // Sort
-        let t2 = Instant::now();
-        sort_by_depth(&mut projected, &mut scratch);
-        let t3 = Instant::now();
-
-        // Composite
-        let t4 = Instant::now();
-        composite_parallel(&projected, &mut fb, args.width, args.height, &params, &pool);
-        let t5 = Instant::now();
-
-        // Halfblocks
-        let t6 = Instant::now();
-        render_halfblocks(&fb, args.width, args.height, &mut out);
-        let t7 = Instant::now();
-
-        let frame_end = Instant::now();
-
-        timings.project_us.push(t1.duration_since(t0).as_micros() as f64);
-        timings.sort_us.push(t3.duration_since(t2).as_micros() as f64);
-        timings.composite_us.push(t5.duration_since(t4).as_micros() as f64);
-        timings.halfblocks_us.push(t7.duration_since(t6).as_micros() as f64);
-        timings.total_us.push(frame_end.duration_since(frame_start).as_micros() as f64);
-
-        if (frame + 1) % 25 == 0 {
-            eprint!("\r  frame {}/{}", frame + 1, args.frames);
-        }
-    }
-    eprintln!();
-
-    let wall_secs = bench_start.elapsed().as_secs_f64();
-    let effective_fps = args.frames as f64 / wall_secs;
-
-    println!("  {:<16} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10}",
-        "stage", "mean(us)", "min(us)", "max(us)", "p50(us)", "p95(us)", "p99(us)");
-    println!("  {}", "-".repeat(82));
-    stats_line("project", &mut timings.project_us);
-    stats_line("sort", &mut timings.sort_us);
-    stats_line("composite", &mut timings.composite_us);
-    stats_line("halfblocks", &mut timings.halfblocks_us);
-    println!("  {}", "-".repeat(82));
-    stats_line("TOTAL", &mut timings.total_us);
     println!();
-    println!("  wall time:      {:.2}s", wall_secs);
-    println!("  effective FPS:  {:.1}", effective_fps);
-    println!("  projected vis:  {} (of {} input)",
-        timings.project_us.len(), splats.len());
-
-    // Print breakdown percentages
-    let total_mean = timings.total_us.iter().sum::<f64>() / timings.total_us.len() as f64;
-    let proj_mean = timings.project_us.iter().sum::<f64>() / timings.project_us.len() as f64;
-    let sort_mean = timings.sort_us.iter().sum::<f64>() / timings.sort_us.len() as f64;
-    let comp_mean = timings.composite_us.iter().sum::<f64>() / timings.composite_us.len() as f64;
-    let half_mean = timings.halfblocks_us.iter().sum::<f64>() / timings.halfblocks_us.len() as f64;
-
-    println!();
-    println!("  --- time breakdown (% of mean total) ---");
-    println!("  project:    {:5.1}%", 100.0 * proj_mean / total_mean);
-    println!("  sort:       {:5.1}%", 100.0 * sort_mean / total_mean);
-    println!("  composite:  {:5.1}%", 100.0 * comp_mean / total_mean);
-    println!("  halfblocks: {:5.1}%", 100.0 * half_mean / total_mean);
-    println!();
+    let _ = (results.first().map(|r| r.frames), baseline_fps);
 }
