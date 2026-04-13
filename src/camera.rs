@@ -1,9 +1,5 @@
 use glam::{Mat4, Quat, Vec3};
 
-/// Orbit camera that circles a target point on a sphere.
-///
-/// `width` / `height` are pixel dimensions of the framebuffer (i.e. terminal
-/// columns for width, 2 * terminal rows for height with half-block rendering).
 pub struct OrbitCamera {
     pub target: Vec3,
     pub yaw: f32,
@@ -16,7 +12,6 @@ pub struct OrbitCamera {
     pub zfar: f32,
 }
 
-/// `view_fwd` is unit eye → target. Returns world-space camera right (strafe / pitch axis).
 fn view_right_world(view_fwd: Vec3, yaw_fallback: f32) -> Vec3 {
     let right = view_fwd.cross(Vec3::Y);
     if right.length_squared() < 1e-12 {
@@ -53,8 +48,6 @@ impl OrbitCamera {
         Mat4::look_at_rh(self.position(), self.target, Vec3::Y)
     }
 
-    /// Returns `(fx, fy, cx, cy)` intrinsics. Half-block pixels are roughly
-    /// square, so `fx == fy`.
     pub fn intrinsics(&self) -> (f32, f32, f32, f32) {
         let fy = 0.5 * self.height as f32 / (0.5 * self.fov_y).tan();
         let fx = fy;
@@ -78,15 +71,12 @@ impl OrbitCamera {
         }
         dir /= len_sq.sqrt();
 
-        // Yaw around camera "up"; then pitch around the new right (FPS-style).
         let view_fwd = -dir;
         let up = view_right_world(view_fwd, self.yaw)
             .cross(view_fwd)
             .normalize();
         if dyaw != 0.0 {
-            dir = Quat::from_axis_angle(up, dyaw)
-                .mul_vec3(dir)
-                .normalize();
+            dir = Quat::from_axis_angle(up, dyaw).mul_vec3(dir).normalize();
         }
 
         let view_fwd = -dir;
@@ -97,7 +87,6 @@ impl OrbitCamera {
                 .normalize();
         }
 
-        // Clamp pitch (same ±89° cap as before).
         let y = dir.y.clamp(-max_y, max_y);
         let xz_sq = dir.x * dir.x + dir.z * dir.z;
         if xz_sq > 1e-12 {
@@ -122,9 +111,6 @@ impl OrbitCamera {
         self.radius = (self.radius * factor).max(1e-3);
     }
 
-    /// Translate the orbit target in the camera's view frame.
-    /// `dx` is strafe right (negative = left). `dz` is along the view ray
-    /// (positive = toward what you're looking at, i.e. typical "forward").
     pub fn pan(&mut self, dx: f32, dz: f32) {
         let eye = self.position();
         let mut view_fwd = self.target - eye;

@@ -6,7 +6,9 @@ use anyhow::Result;
 use clap::Parser as ClapParser;
 use crossterm::{
     cursor,
-    event::{self, EnableMouseCapture, DisableMouseCapture, Event, KeyCode, KeyModifiers, MouseEventKind},
+    event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers, MouseEventKind,
+    },
     execute, terminal,
 };
 use glam::Vec3;
@@ -22,57 +24,54 @@ mod splat;
 use camera::OrbitCamera;
 use display::{Backend, Display};
 use hud::{DisplayInfo, HudAction, HudState};
-use rasterize::{ScratchBuffers, build_thread_pool, composite_parallel, project, sort_by_depth_parallel};
+use rasterize::{
+    ScratchBuffers, build_thread_pool, composite_parallel, project, sort_by_depth_parallel,
+};
 use splat::{Splat, load_ply};
 
-/// HUD default `rotation_speed`; auto-orbit scales it to this angular velocity (rad/s)
-/// when that slider is at its default, so teaser capture stays ~one slow turn per 12s.
 const AUTO_ORBIT_RAD_PER_SEC_AT_DEFAULT_ROT_SPEED: f32 = 0.5;
 const AUTO_ORBIT_ROT_SPEED_REF: f32 = 0.035;
 
 #[derive(ClapParser, Debug)]
 #[command(
     name = "tsplat",
-    about = "Terminal 3D Gaussian Splatting renderer (CPU, half-block)"
+    about = "Terminal 3D Gaussian Splatting (CPU, half-block)"
 )]
 struct Args {
-    /// Path to an INRIA 3DGS `.ply` scene.
     ply: PathBuf,
-
-    /// Maximum number of splats to load. Set to 0 (or pass --no-cap) to
-    /// load everything.
     #[arg(long, default_value_t = 200_000)]
     max_splats: usize,
-
-    /// Load every splat, regardless of --max-splats.
     #[arg(long, default_value_t = false)]
     no_cap: bool,
-
-    /// Treat opacity as already in [0, 1] instead of applying sigmoid.
-    /// Useful if the scene looks hazy on first load.
     #[arg(long, default_value_t = false)]
     raw_opacity: bool,
-
-    /// Load, print stats, exit — don't enter the render loop.
     #[arg(long, default_value_t = false)]
     dump_stats: bool,
 }
 
-/// RAII guard that enters alt-screen + raw mode on construction and restores
-/// the terminal on drop (including on panic).
 struct TerminalGuard;
 
 impl TerminalGuard {
     fn new() -> Result<Self> {
         terminal::enable_raw_mode()?;
-        execute!(stdout(), terminal::EnterAlternateScreen, cursor::Hide, EnableMouseCapture)?;
+        execute!(
+            stdout(),
+            terminal::EnterAlternateScreen,
+            cursor::Hide,
+            EnableMouseCapture
+        )?;
         Ok(Self)
     }
 }
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
-        let _ = execute!(stdout(), DisableMouseCapture, cursor::Show, terminal::LeaveAlternateScreen);
+        let _ = execute!(
+            stdout(),
+            DisableMouseCapture,
+            cursor::Show,
+            terminal::LeaveAlternateScreen
+        );
         let _ = terminal::disable_raw_mode();
     }
 }
@@ -127,7 +126,11 @@ fn main() -> Result<()> {
     eprintln!(
         "loading {} (cap: {}) ...",
         args.ply.display(),
-        if cap == 0 { "none".into() } else { cap.to_string() }
+        if cap == 0 {
+            "none".into()
+        } else {
+            cap.to_string()
+        }
     );
     let (mut splats, total_splats) = load_ply(&args.ply, !args.raw_opacity, cap)?;
     eprintln!("loaded {} / {} splats", splats.len(), total_splats);
@@ -136,17 +139,14 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    // Guard runs first so a panic restores the terminal.
     let _guard = TerminalGuard::new()?;
 
     let (cols, rows) = terminal::size()?;
     let cols = cols as u32;
     let rows = rows as u32;
 
-    // Detect backend and cell pixel size (must happen in raw mode).
     let mut display = Display::new(cols, rows);
 
-    // Get initial framebuffer dimensions from the display backend.
     let (mut width, mut height) = display.framebuffer_size();
 
     let mut camera = OrbitCamera::new(width, height);
@@ -163,10 +163,6 @@ fn main() -> Result<()> {
     let mut fps = 0.0_f32;
     let mut needs_reload = false;
     let mut needs_fb_resize = false;
-    // Dirty-frame rendering: the scene is static, so we only rasterize when
-    // something actually changed (camera moved, HUD toggled, etc). This kills
-    // the perceived flicker that came from continuously repainting identical
-    // frames at low FPS.
     let mut needs_redraw = true;
     let mut thread_pool = build_thread_pool(hud.num_threads);
     let mut last_num_threads = hud.num_threads;
@@ -175,7 +171,6 @@ fn main() -> Result<()> {
     let mut last_wallclock = Instant::now();
 
     loop {
-        // ---- apply deferred resize ----
         if needs_fb_resize {
             let (new_w, new_h) = display.framebuffer_size();
             width = new_w;
@@ -185,7 +180,6 @@ fn main() -> Result<()> {
             needs_fb_resize = false;
         }
 
-        // ---- apply deferred reload ----
         if needs_reload {
             {
                 let mut so = stdout().lock();
@@ -195,13 +189,10 @@ fn main() -> Result<()> {
             let (new_splats, _total) = load_ply(&args.ply, hud.apply_sigmoid, hud.max_splats)?;
             splats = new_splats;
             needs_reload = false;
-            // A reload flushed a text bar to stdout that the next frame must
-            // wipe; also the scene pixels have actually changed.
             display.queue_text_clear();
             needs_redraw = true;
         }
 
-        // ---- time-based auto orbit (for screen capture / teaser clips) ----
         let now = Instant::now();
         let mut dt = now.duration_since(last_wallclock).as_secs_f32();
         last_wallclock = now;
@@ -213,13 +204,10 @@ fn main() -> Result<()> {
             needs_redraw = true;
         }
 
-        // ---- render only when the scene is dirty ----
         if needs_redraw {
-            // Fast zero-fill.
             unsafe {
                 std::ptr::write_bytes(fb.as_mut_ptr(), 0, fb.len());
             }
-            // Rebuild thread pool only when thread count changes.
             if hud.num_threads != last_num_threads {
                 thread_pool = build_thread_pool(hud.num_threads);
                 last_num_threads = hud.num_threads;
@@ -228,12 +216,18 @@ fn main() -> Result<()> {
             let render_params = &hud.render_params;
             let mut projected = project(&splats, &camera, render_params, &thread_pool);
             sort_by_depth_parallel(&mut projected, &mut scratch, &thread_pool);
-            composite_parallel(&projected, &mut fb, width, height, render_params, &mut scratch, &thread_pool);
+            composite_parallel(
+                &projected,
+                &mut fb,
+                width,
+                height,
+                render_params,
+                &mut scratch,
+                &thread_pool,
+            );
 
-            // Convert framebuffer to terminal output.
             display.render(&fb, width, height);
 
-            // ---- FPS overlay ----
             frames_since_report += 1;
             let now = Instant::now();
             let elapsed = now.duration_since(last_fps_report).as_secs_f32();
@@ -257,7 +251,6 @@ fn main() -> Result<()> {
                 use std::fmt::Write as _;
                 let _ = write!(out, "\x1b[1;{}H\x1b[97;40m{}\x1b[0m", col, fps_str);
 
-                // ---- HUD overlay ----
                 hud.render(&camera, &di, out);
             }
 
@@ -265,12 +258,6 @@ fn main() -> Result<()> {
             needs_redraw = false;
         }
 
-        // ---- wait for input (blocking with a cap so we stay responsive) ----
-        //
-        // A 33ms cap keeps first-keypress latency comfortably below the
-        // ~50ms "feels instant" threshold without ever spinning. When events
-        // do arrive, poll returns immediately, so this does not cap the
-        // interactive frame rate.
         let poll_wait = if auto_orbit {
             Duration::from_millis(16)
         } else {
@@ -280,8 +267,6 @@ fn main() -> Result<()> {
             continue;
         }
 
-        // Drain everything that is already queued so a burst of key repeats
-        // collapses into a single frame.
         while event::poll(Duration::from_millis(0))? {
             match event::read()? {
                 Event::Key(k) => match k.code {
@@ -308,17 +293,11 @@ fn main() -> Result<()> {
                     KeyCode::Tab => {
                         let was_visible = hud.visible;
                         hud.toggle();
-                        // Hiding the HUD in Kitty leaves stale text cells
-                        // sitting on top of the image (z=under-UI), so they
-                        // have to be erased explicitly — otherwise the panel
-                        // lingers and the user sees it "scroll" away as new
-                        // cells are touched.
                         if was_visible && !hud.visible && display.backend == Backend::Kitty {
                             display.queue_text_clear();
                         }
                         needs_redraw = true;
                     }
-                    // H/L + Up/Down: pitch; J/K + Left/Right: yaw (camera-relative orbit).
                     KeyCode::Char('h') | KeyCode::Char('H') => {
                         camera.orbit(0.0, hud.rotation_speed);
                         needs_redraw = true;
@@ -343,7 +322,6 @@ fn main() -> Result<()> {
                         camera.zoom(1.0 + hud.zoom_step);
                         needs_redraw = true;
                     }
-                    // WASD: view-relative pan (speed from HUD).
                     KeyCode::Char('w') | KeyCode::Char('W') => {
                         let step = camera.radius * hud.translate_speed;
                         camera.pan(0.0, step);
@@ -369,7 +347,6 @@ fn main() -> Result<()> {
                         last_wallclock = Instant::now();
                         needs_redraw = true;
                     }
-                    // Arrows: HUD when open, else camera orbit (same mapping as J/K and H/L).
                     KeyCode::Up | KeyCode::Down | KeyCode::Left | KeyCode::Right => {
                         if hud.visible {
                             let action = hud.handle_key(k.code);
@@ -393,7 +370,6 @@ fn main() -> Result<()> {
                             needs_redraw = true;
                         }
                     }
-                    // Same HUD behavior without using arrow keys (optional).
                     KeyCode::PageUp
                     | KeyCode::PageDown
                     | KeyCode::Char(',')

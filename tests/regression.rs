@@ -1,19 +1,3 @@
-//! Regression tests for the forward-pass pipeline.
-//!
-//! Uses a deterministic synthetic random-gaussian scene (no .ply file on
-//! disk). Covers:
-//!
-//! 1. **Determinism** — running the pipeline twice with identical inputs must
-//!    produce byte-identical framebuffers.
-//! 2. **Parallel/serial equivalence** — `composite_parallel` and the
-//!    single-threaded `composite` must produce the same framebuffer (within a
-//!    tiny FP tolerance for order-of-accumulation effects).
-//! 3. **Sanity** — the pipeline actually writes non-trivial output (enough
-//!    touched pixels, colors in [0,1], finite values).
-//! 4. **ANSI output** — non-empty, half-block characters present.
-//!
-//! Run with: `cargo test --release --test regression`
-
 use glam::Vec3;
 
 use tsplat::camera::OrbitCamera;
@@ -74,7 +58,15 @@ fn run_pipeline_parallel(threads: usize) -> Vec<(Vec3, f32)> {
     let mut scratch = ScratchBuffers::new();
     let mut projected = project(&splats, &camera, &params, &pool);
     sort_by_depth(&mut projected, &mut scratch);
-    composite_parallel(&projected, &mut fb, WIDTH, HEIGHT, &params, &mut scratch, &pool);
+    composite_parallel(
+        &projected,
+        &mut fb,
+        WIDTH,
+        HEIGHT,
+        &params,
+        &mut scratch,
+        &pool,
+    );
     fb
 }
 
@@ -108,8 +100,6 @@ fn forward_pass_parallel_matches_serial() {
 
     assert_eq!(serial_fb.len(), parallel_fb.len());
 
-    // Tile boundaries can introduce order-of-accumulation drift at the
-    // ~1e-5 scale. Everything should be within a very loose tolerance.
     let mut max_rgb_diff: f32 = 0.0;
     let mut max_alpha_diff: f32 = 0.0;
     for (i, (s, p)) in serial_fb.iter().zip(parallel_fb.iter()).enumerate() {
@@ -147,8 +137,6 @@ fn forward_pass_parallel_matches_serial() {
 fn forward_pass_sanity() {
     let (fb, _) = run_pipeline_serial();
 
-    // At least 5% of pixels should have been touched. A synthetic cube
-    // straddling the view should fill a good chunk of the frame.
     let hits = touched_pixels(&fb);
     let total = fb.len();
     assert!(
@@ -156,11 +144,16 @@ fn forward_pass_sanity() {
         "only {hits}/{total} pixels touched; scene/camera likely broken"
     );
 
-    // All values must be finite and within sensible ranges.
     for (i, (rgb, a)) in fb.iter().enumerate() {
-        assert!(rgb.x.is_finite() && rgb.y.is_finite() && rgb.z.is_finite(), "nan/inf rgb at {i}");
+        assert!(
+            rgb.x.is_finite() && rgb.y.is_finite() && rgb.z.is_finite(),
+            "nan/inf rgb at {i}"
+        );
         assert!(a.is_finite(), "nan/inf alpha at {i}");
-        assert!(*a >= 0.0 && *a <= 1.0 + 1e-5, "alpha out of range at {i}: {a}");
+        assert!(
+            *a >= 0.0 && *a <= 1.0 + 1e-5,
+            "alpha out of range at {i}: {a}"
+        );
         assert!(
             rgb.x >= -1e-5 && rgb.y >= -1e-5 && rgb.z >= -1e-5,
             "negative rgb at {i}: {rgb:?}"

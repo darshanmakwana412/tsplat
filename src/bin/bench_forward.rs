@@ -1,16 +1,3 @@
-//! Synthetic-scene forward-pass benchmark with detailed per-stage stats and
-//! thread-scaling sweep.
-//!
-//! By default loads a deterministic random gaussian scene (no .ply needed) and
-//! runs the full pipeline for N frames per configured thread count, printing
-//! per-stage mean/min/max/p50/p95/p99 in microseconds and a scaling table.
-//!
-//! Usage:
-//!   cargo run --release --bin bench_forward
-//!   cargo run --release --bin bench_forward -- --frames 200 --splats 500000
-//!   cargo run --release --bin bench_forward -- --threads 1,2,4,8,16
-//!   cargo run --release --bin bench_forward -- --ply path/to/scene.ply
-
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -56,12 +43,30 @@ fn parse_args() -> BenchArgs {
     let mut i = 1;
     while i < raw.len() {
         match raw[i].as_str() {
-            "--frames" | "-n" => { i += 1; args.frames = raw[i].parse().expect("invalid --frames"); }
-            "--warmup" => { i += 1; args.warmup = raw[i].parse().expect("invalid --warmup"); }
-            "--splats" | "--max-splats" => { i += 1; args.splats = raw[i].parse().expect("invalid --splats"); }
-            "--width" => { i += 1; args.width = raw[i].parse().expect("invalid --width"); }
-            "--height" => { i += 1; args.height = raw[i].parse().expect("invalid --height"); }
-            "--seed" => { i += 1; args.seed = raw[i].parse().expect("invalid --seed"); }
+            "--frames" | "-n" => {
+                i += 1;
+                args.frames = raw[i].parse().expect("invalid --frames");
+            }
+            "--warmup" => {
+                i += 1;
+                args.warmup = raw[i].parse().expect("invalid --warmup");
+            }
+            "--splats" | "--max-splats" => {
+                i += 1;
+                args.splats = raw[i].parse().expect("invalid --splats");
+            }
+            "--width" => {
+                i += 1;
+                args.width = raw[i].parse().expect("invalid --width");
+            }
+            "--height" => {
+                i += 1;
+                args.height = raw[i].parse().expect("invalid --height");
+            }
+            "--seed" => {
+                i += 1;
+                args.seed = raw[i].parse().expect("invalid --seed");
+            }
             "--threads" => {
                 i += 1;
                 args.threads = raw[i]
@@ -69,7 +74,10 @@ fn parse_args() -> BenchArgs {
                     .map(|s| s.trim().parse().expect("invalid thread count"))
                     .collect();
             }
-            "--ply" => { i += 1; args.ply = Some(PathBuf::from(&raw[i])); }
+            "--ply" => {
+                i += 1;
+                args.ply = Some(PathBuf::from(&raw[i]));
+            }
             "--help" | "-h" => {
                 eprintln!("Usage: bench_forward [OPTIONS]");
                 eprintln!("  --frames N       Frames per thread setting (default: 120)");
@@ -82,7 +90,10 @@ fn parse_args() -> BenchArgs {
                 eprintln!("  --ply PATH       Use a real .ply scene instead of synthetic");
                 std::process::exit(0);
             }
-            other => { eprintln!("Unknown argument: {other}. Use --help for usage."); std::process::exit(1); }
+            other => {
+                eprintln!("Unknown argument: {other}. Use --help for usage.");
+                std::process::exit(1);
+            }
         }
         i += 1;
     }
@@ -91,8 +102,6 @@ fn parse_args() -> BenchArgs {
 
 fn bench_camera(width: u32, height: u32) -> OrbitCamera {
     let mut cam = OrbitCamera::new(width, height);
-    // Centered on the origin of the synthetic cube, far enough to see
-    // everything. Fov/pitch/yaw picked to stress projection across screen.
     cam.target = Vec3::ZERO;
     cam.yaw = 0.6;
     cam.pitch = 0.35;
@@ -106,7 +115,6 @@ fn load_scene(args: &BenchArgs) -> Vec<Splat> {
         let (splats, _) = load_ply(path, true, args.splats).expect("failed to load .ply");
         splats
     } else {
-        // 20-unit cube is a good match for a camera radius of 55 with 55° fov.
         random_scene(args.splats, args.seed, 20.0)
     }
 }
@@ -121,12 +129,16 @@ struct Timings {
 }
 
 fn percentile(sorted: &[f64], p: f64) -> f64 {
-    if sorted.is_empty() { return 0.0; }
+    if sorted.is_empty() {
+        return 0.0;
+    }
     let idx = (p / 100.0 * (sorted.len() - 1) as f64).round() as usize;
     sorted[idx.min(sorted.len() - 1)]
 }
 
-fn mean(v: &[f64]) -> f64 { v.iter().sum::<f64>() / v.len() as f64 }
+fn mean(v: &[f64]) -> f64 {
+    v.iter().sum::<f64>() / v.len() as f64
+}
 
 fn print_stats(label: &str, values: &mut Vec<f64>) {
     values.sort_by(|a, b| a.partial_cmp(b).unwrap());
@@ -163,10 +175,20 @@ fn run_one(threads: usize, splats: &[Splat], args: &BenchArgs) -> RunResult {
     let mut scratch = ScratchBuffers::new();
 
     for _ in 0..args.warmup {
-        unsafe { std::ptr::write_bytes(fb.as_mut_ptr(), 0, fb.len()); }
+        unsafe {
+            std::ptr::write_bytes(fb.as_mut_ptr(), 0, fb.len());
+        }
         let mut projected = project(splats, &camera, &params, &pool);
         sort_by_depth_parallel(&mut projected, &mut scratch, &pool);
-        composite_parallel(&projected, &mut fb, args.width, args.height, &params, &mut scratch, &pool);
+        composite_parallel(
+            &projected,
+            &mut fb,
+            args.width,
+            args.height,
+            &params,
+            &mut scratch,
+            &pool,
+        );
         render_halfblocks(&fb, args.width, args.height, &mut out);
     }
 
@@ -174,7 +196,9 @@ fn run_one(threads: usize, splats: &[Splat], args: &BenchArgs) -> RunResult {
     let wall_start = Instant::now();
 
     for _ in 0..args.frames {
-        unsafe { std::ptr::write_bytes(fb.as_mut_ptr(), 0, fb.len()); }
+        unsafe {
+            std::ptr::write_bytes(fb.as_mut_ptr(), 0, fb.len());
+        }
         let f0 = Instant::now();
 
         let t0 = Instant::now();
@@ -184,7 +208,15 @@ fn run_one(threads: usize, splats: &[Splat], args: &BenchArgs) -> RunResult {
         sort_by_depth_parallel(&mut projected, &mut scratch, &pool);
         let t2 = Instant::now();
 
-        composite_parallel(&projected, &mut fb, args.width, args.height, &params, &mut scratch, &pool);
+        composite_parallel(
+            &projected,
+            &mut fb,
+            args.width,
+            args.height,
+            &params,
+            &mut scratch,
+            &pool,
+        );
         let t3 = Instant::now();
 
         render_halfblocks(&fb, args.width, args.height, &mut out);
@@ -239,7 +271,10 @@ fn main() {
     println!("  splats:     {}", splats.len());
     println!(
         "  resolution: {}x{} ({}x{} terminal cells)",
-        args.width, args.height, args.width, args.height / 2,
+        args.width,
+        args.height,
+        args.width,
+        args.height / 2,
     );
     println!(
         "  frames:     {} per config (+{} warmup)",

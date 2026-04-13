@@ -4,17 +4,7 @@ use std::time::Duration;
 
 use crate::framebuffer;
 
-/// Kitty `z=` so the splat image stays *under* text. Default stacking paints the
-/// image above cells, so every `a=T` refresh briefly covers FPS/HUD. Values below
-/// `INT32_MIN / 2` are required for cells with explicit SGR backgrounds (HUD).
 const KITTY_IMG_Z_UNDER_UI: i32 = -1_073_741_825;
-
-// ── TTY poll (avoid crossterm during Kitty probe / cell-size query) ─────────
-//
-// `crossterm::event::poll` reads from the tty and feeds bytes through its
-// escape parser. Kitty graphics replies (`ESC _ G …`) are not crossterm events;
-// the parser clears them as garbage. Using poll+read here would make
-// `probe_kitty_support` always fail and force HalfBlock mode.
 
 #[cfg(unix)]
 fn open_tty_for_read() -> io::Result<std::fs::File> {
@@ -35,16 +25,9 @@ fn tty_poll_readable(fd: std::os::unix::io::RawFd, timeout_ms: i32) -> io::Resul
     Ok(n > 0 && (pfd.revents & libc::POLLIN) != 0)
 }
 
-// ── Backend enum ────────────────────────────────────────────────────────────
-
-/// Which rendering backend we're using to get pixels on screen.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Backend {
-    /// Unicode half-block characters with 24-bit SGR color.
-    /// Each terminal cell = 1 column wide × 2 pixels tall.
     HalfBlock,
-    /// Kitty graphics protocol: raw RGB pixel data sent via APC escape.
-    /// Each terminal cell = cell_w × cell_h real pixels.
     Kitty,
 }
 
@@ -57,9 +40,6 @@ impl Backend {
     }
 }
 
-// ── Cell pixel size ─────────────────────────────────────────────────────────
-
-/// Pixel dimensions of a single terminal cell.
 #[derive(Clone, Copy, Debug)]
 pub struct CellSize {
     pub w: u32,
@@ -68,15 +48,10 @@ pub struct CellSize {
 
 impl Default for CellSize {
     fn default() -> Self {
-        // Conservative default: half-block assumption (1×2).
         Self { w: 1, h: 2 }
     }
 }
 
-// ── Detection ───────────────────────────────────────────────────────────────
-
-/// Probe whether the terminal supports the Kitty graphics protocol.
-/// Must be called while the terminal is in raw mode.
 pub fn probe_kitty_support() -> bool {
     #[cfg(not(unix))]
     {
@@ -94,7 +69,6 @@ pub fn probe_kitty_support() -> bool {
 
         let mut stdout = io::stdout().lock();
 
-        // Send graphics query (a=q) with a 1×1 RGB pixel, plus DA1 as a fence.
         let probe = b"\x1b_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\\x1b[c";
         if stdout.write_all(probe).is_err() || stdout.flush().is_err() {
             return false;
@@ -131,15 +105,13 @@ pub fn probe_kitty_support() -> bool {
 fn contains_kitty_ok(buf: &[u8]) -> bool {
     let st_backslash = b"\x1b_Gi=31;OK\x1b\\";
     let st_string_term = b"\x1b_Gi=31;OK\x9c";
-    buf.windows(st_backslash.len())
-        .any(|w| w == st_backslash)
+    buf.windows(st_backslash.len()).any(|w| w == st_backslash)
         || buf
             .windows(st_string_term.len())
             .any(|w| w == st_string_term)
         || contains_subseq(buf, b"i=31;OK")
 }
 
-/// Loose match for terminals that elide pieces of the APC wrapper.
 fn contains_subseq(haystack: &[u8], needle: &[u8]) -> bool {
     haystack
         .windows(needle.len())
@@ -159,7 +131,6 @@ fn contains_da1_response(buf: &[u8]) -> bool {
     false
 }
 
-/// Query terminal cell pixel size via CSI 16 t.
 pub fn query_cell_size() -> Option<CellSize> {
     #[cfg(not(unix))]
     {
@@ -174,7 +145,6 @@ pub fn query_cell_size() -> Option<CellSize> {
 
         let mut stdout = io::stdout().lock();
 
-        // CSI 16 t → response: CSI 6 ; height ; width t
         let query = b"\x1b[16t\x1b[c";
         if stdout.write_all(query).is_err() || stdout.flush().is_err() {
             return None;
@@ -184,10 +154,6 @@ pub fn query_cell_size() -> Option<CellSize> {
         let mut filled = 0usize;
         let deadline = std::time::Instant::now() + Duration::from_millis(300);
 
-        // Do not bail out on the first DA1 (`\x1b[?…c`): a successful Kitty graphics
-        // probe leaves the *previous* query's DA1 reply in the queue (the probe ends
-        // with `\x1b[c`). Treating that as "CSI 16t unsupported" breaks cell-size
-        // discovery and keeps the default 1×2 cell → same resolution as half-blocks.
         while std::time::Instant::now() < deadline && filled < buf.len() {
             if !tty_poll_readable(tty_fd, 50).unwrap_or(false) {
                 continue;
@@ -197,8 +163,6 @@ pub fn query_cell_size() -> Option<CellSize> {
                 Ok(n) => {
                     filled += n;
                     if let Some(cs) = parse_cell_size_response(&buf[..filled]) {
-                        // This query ends with `\x1b[c`; read the matching DA1 so the
-                        // main event loop does not inherit stray escape input.
                         let mut drain = [0u8; 256];
                         if tty_poll_readable(tty_fd, 20).unwrap_or(false) {
                             let _ = tty_in.read(&mut drain);
@@ -215,7 +179,6 @@ pub fn query_cell_size() -> Option<CellSize> {
 }
 
 fn parse_cell_size_response(buf: &[u8]) -> Option<CellSize> {
-    // Look for \x1b [ 6 ; H ; W t
     for i in 0..buf.len().saturating_sub(6) {
         if buf[i] == 0x1b && buf[i + 1] == b'[' && buf[i + 2] == b'6' && buf[i + 3] == b';' {
             let rest = &buf[i + 4..];
@@ -234,11 +197,10 @@ fn parse_cell_size_response(buf: &[u8]) -> Option<CellSize> {
     None
 }
 
-/// Try to get cell pixel size from the ioctl-based window_size().
 pub fn cell_size_from_ioctl(_cols: u32, _rows: u32) -> Option<CellSize> {
     let ws = crossterm::terminal::window_size().ok()?;
-    let pw = ws.width as u32;   // total pixel width
-    let ph = ws.height as u32;  // total pixel height
+    let pw = ws.width as u32;
+    let ph = ws.height as u32;
     let cols = ws.columns as u32;
     let rows = ws.rows as u32;
     if pw == 0 || ph == 0 || cols == 0 || rows == 0 {
@@ -250,37 +212,19 @@ pub fn cell_size_from_ioctl(_cols: u32, _rows: u32) -> Option<CellSize> {
     })
 }
 
-// ── Display ─────────────────────────────────────────────────────────────────
-
-/// Manages the rendering backend, resolution, and output buffer.
-///
-/// The render pipeline is:
-///   1. `display.framebuffer_size()` → tells the rasterizer how many pixels
-///   2. Rasterizer fills the framebuffer
-///   3. `display.render(fb, w, h)` → converts pixels to the terminal format
-///   4. Caller appends ANSI overlays (FPS, HUD) via `display.overlay_string()`
-///   5. `display.flush()` → single write_all to stdout
 pub struct Display {
     pub backend: Backend,
     pub detected_backend: Backend,
     pub cols: u32,
     pub rows: u32,
     pub cell_size: CellSize,
-    /// Pixel density multiplier (0.25 .. 1.0). 1.0 = full native resolution.
-    /// Only affects Kitty backend. HalfBlock always uses 1 col × 2 rows.
     pub pixel_density: f32,
-    /// The frame output buffer. Contains the pixel data (halfblock escapes or
-    /// kitty APC sequences). ANSI overlays (FPS, HUD) are appended after render().
     frame: String,
-    /// Kitty image id, incremented to avoid stale image artifacts.
     kitty_img_id: u32,
-    /// When true, the next `render()` prepends `ED 2` + home to wipe the
-    /// terminal text layer. Set via `queue_text_clear()` on transitions.
     pending_text_clear: bool,
 }
 
 impl Display {
-    /// Create a new Display. Call after TerminalGuard::new() so raw mode is active.
     pub fn new(cols: u32, rows: u32) -> Self {
         let kitty_supported = probe_kitty_support();
 
@@ -307,12 +251,9 @@ impl Display {
         }
     }
 
-    /// Pixel dimensions of the framebuffer for the current backend + density.
     pub fn framebuffer_size(&self) -> (u32, u32) {
         match self.backend {
-            Backend::HalfBlock => {
-                (self.cols, self.rows * 2)
-            }
+            Backend::HalfBlock => (self.cols, self.rows * 2),
             Backend::Kitty => {
                 let w = ((self.cols * self.cell_size.w) as f32 * self.pixel_density) as u32;
                 let h = ((self.rows * self.cell_size.h) as f32 * self.pixel_density) as u32;
@@ -321,7 +262,6 @@ impl Display {
         }
     }
 
-    /// Handle a terminal resize.
     pub fn resize(&mut self, cols: u32, rows: u32) {
         self.cols = cols;
         self.rows = rows;
@@ -330,9 +270,6 @@ impl Display {
         }
     }
 
-    /// Render the framebuffer into the internal frame buffer.
-    /// After this call, use `overlay_string()` to append HUD/FPS text,
-    /// then call `flush()`.
     pub fn render(&mut self, fb: &[(Vec3, f32)], width: u32, height: u32) {
         match self.backend {
             Backend::HalfBlock => {
@@ -343,61 +280,39 @@ impl Display {
             }
         }
         if self.pending_text_clear {
-            // Both backends start the frame with `\x1b[H`. Prepending
-            // `\x1b[2J` makes the full sequence `ED 2` then home, which wipes
-            // stale text without disturbing the Kitty image layer.
             self.frame.insert_str(0, "\x1b[2J");
             self.pending_text_clear = false;
         }
     }
 
-    /// Returns a mutable reference to the frame string so the caller can
-    /// append cursor-addressed ANSI overlays (FPS counter, HUD panel).
-    /// These will be rendered on top of both backends since they use
-    /// absolute cursor positioning.
     pub fn overlay_string(&mut self) -> &mut String {
         &mut self.frame
     }
 
-    /// Erase the terminal text layer at the start of the next frame. In Kitty
-    /// the image is placed under text (see `KITTY_IMG_Z_UNDER_UI`) so stale
-    /// halfblock characters or HUD cells would otherwise stay visible on top
-    /// of a newly-transmitted image. `ED 2` only touches the text layer —
-    /// Kitty graphics are retained.
-    ///
-    /// Callers should invoke this before `render()` on transitions: backend
-    /// switch, HUD hide-in-kitty, resize, density change.
     pub fn queue_text_clear(&mut self) {
         self.pending_text_clear = true;
     }
 
-    /// Write the complete frame to stdout in one shot.
     pub fn flush(&self) -> io::Result<()> {
         let mut stdout = io::stdout().lock();
         stdout.write_all(self.frame.as_bytes())?;
         stdout.flush()
     }
 
-    /// Clean up kitty state (delete images) before switching backends or exiting.
     pub fn kitty_cleanup(&mut self) {
         if self.backend == Backend::Kitty || self.detected_backend == Backend::Kitty {
             let mut stdout = io::stdout().lock();
-            // Delete all images placed by us.
-            let _ = stdout.write_all(
-                format!("\x1b_Ga=d,d=I,i={}\x1b\\", self.kitty_img_id).as_bytes(),
-            );
+            let _ =
+                stdout.write_all(format!("\x1b_Ga=d,d=I,i={}\x1b\\", self.kitty_img_id).as_bytes());
             let _ = stdout.flush();
         }
     }
-
-    // ── Kitty rendering ─────────────────────────────────────────────────
 
     fn render_kitty(&mut self, fb: &[(Vec3, f32)], width: u32, height: u32) {
         self.frame.clear();
 
         let pixel_count = (width * height) as usize;
 
-        // Build raw RGB bytes.
         let mut rgb = Vec::with_capacity(pixel_count * 3);
         for &(color, _) in &fb[..pixel_count] {
             rgb.push((color.x * 255.0).clamp(0.0, 255.0) as u8);
@@ -405,14 +320,11 @@ impl Display {
             rgb.push((color.z * 255.0).clamp(0.0, 255.0) as u8);
         }
 
-        // Home cursor so the image starts at top-left.
         self.frame.push_str("\x1b[H");
 
-        // Base64 encode.
         let mut b64 = Vec::with_capacity(rgb.len() * 4 / 3 + 4);
         base64_encode_into(&rgb, &mut b64);
 
-        // Transmit in chunks.
         const CHUNK: usize = 4096;
         let total = (b64.len() + CHUNK - 1) / CHUNK;
 
@@ -421,15 +333,6 @@ impl Display {
             let m = if is_last { 0 } else { 1 };
 
             if ci == 0 {
-                // First chunk with full metadata.
-                // a=T transmit+display, f=24 RGB, t=d direct,
-                // s/v pixel dims, c/r cell dims for scaling,
-                // i=id p=1 for flicker-free replacement, q=2 suppress response,
-                // C=1 keeps the cursor where it was — without it, placing a
-                // `rows`-tall image from (1,1) advances the cursor past the
-                // bottom of the alt-screen and the terminal scrolls up one
-                // line per frame, which is what produced the "slide up" when
-                // toggling halfblock → kitty.
                 use std::fmt::Write;
                 let _ = write!(
                     self.frame,
@@ -440,19 +343,13 @@ impl Display {
                 use std::fmt::Write;
                 let _ = write!(self.frame, "\x1b_Gm={};", m);
             }
-            // Append base64 chunk (it's ASCII, safe to push as str).
-            // SAFETY: base64 output is always valid ASCII.
             unsafe {
-                self.frame
-                    .as_mut_vec()
-                    .extend_from_slice(chunk);
+                self.frame.as_mut_vec().extend_from_slice(chunk);
             }
             self.frame.push_str("\x1b\\");
         }
     }
 }
-
-// ── Base64 encoder ──────────────────────────────────────────────────────────
 
 const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
