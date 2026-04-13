@@ -1,7 +1,18 @@
 # tsplat
-> Run Gaussian Splatting in your terminal, works over SSH, and supports any terminal out of the box
 
-## table of contents
+Run Gaussian Splatting in your terminal, works over SSH, and supports xterm, kitty, GNOME, Konsole, it's fast, written in rust and is CPU only
+
+![](./assets/view.png)
+
+## Installation
+
+```bash
+cargo install --git 
+```
+
+## Tutorial on Gaussian Splatting
+
+I recently discovered some of my notes related to it and decided to digitize it this weekend, along the way I reimplemented the forward rasterization pass in rust and decided it would be fun to write a tutorial explaining gaussian splatting to everyone, so here it is
 
 - [What is a splat?](#what-is-a-gaussian-splat)
 - [The forward pass pipeline](#the-forward-pass-pipeline)
@@ -692,18 +703,11 @@ pub struct ScratchBuffers {
 
 the `sort_aux` vec grows to fit the first frame and never shrinks this enables us to do zero per-frame heap allocation once the system has warmed up.
 
-## building and running
-
-```sh
-cargo build --release
-cargo run --release -- path/to/scene.ply
-```
-
-the `--release` flag is important — debug builds are 10–20× slower due to bounds checks and unoptimized math.
-
 ## acknowledgments
 
 - the original [3D Gaussian Splatting paper](https://repo-sam.inria.fr/fungraph/3d-gaussian-splatting/) by Kerbl et al.
-- [kwea123's splatting notes](https://github.com/kwea123/gaussian_splatting_notes) for a clear walkthrough of the GPU CUDA code
-- [FlashGS](https://github.com/InternLandMark/FlashGS) for the opacity-aware bounding box idea
 - the [LichtFeld-Studio](https://github.com/LichtFeld-Studio) C++ reference implementation
+
+## License
+
+> MIT License
