@@ -120,12 +120,12 @@ fn contains_subseq(haystack: &[u8], needle: &[u8]) -> bool {
 
 fn contains_da1_response(buf: &[u8]) -> bool {
     for i in 0..buf.len().saturating_sub(3) {
-        if buf[i] == 0x1b && buf[i + 1] == b'[' && buf[i + 2] == b'?' {
-            for j in (i + 3)..buf.len() {
-                if buf[j] == b'c' {
-                    return true;
-                }
-            }
+        if buf[i] == 0x1b
+            && buf[i + 1] == b'['
+            && buf[i + 2] == b'?'
+            && buf.iter().skip(i + 3).any(|&b| b == b'c')
+        {
+            return true;
         }
     }
     false
@@ -326,7 +326,7 @@ impl Display {
         base64_encode_into(&rgb, &mut b64);
 
         const CHUNK: usize = 4096;
-        let total = (b64.len() + CHUNK - 1) / CHUNK;
+        let total = b64.len().div_ceil(CHUNK);
 
         for (ci, chunk) in b64.chunks(CHUNK).enumerate() {
             let is_last = ci == total - 1;

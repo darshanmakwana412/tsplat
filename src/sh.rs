@@ -1,6 +1,6 @@
 use glam::Vec3;
 
-pub const SH_C0: f32 = 0.28209479177387814;
+pub const SH_C0: f32 = 0.282_094_8;
 
 #[inline]
 pub fn sh_band0_to_rgb(f_dc: Vec3) -> Vec3 {

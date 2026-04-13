@@ -140,7 +140,7 @@ fn mean(v: &[f64]) -> f64 {
     v.iter().sum::<f64>() / v.len() as f64
 }
 
-fn print_stats(label: &str, values: &mut Vec<f64>) {
+fn print_stats(label: &str, values: &mut [f64]) {
     values.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let m = mean(values);
     let min = values[0];

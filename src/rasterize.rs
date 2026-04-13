@@ -18,6 +18,12 @@ impl ScratchBuffers {
     }
 }
 
+impl Default for ScratchBuffers {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 pub const TILE_W: i32 = 16;
 pub const TILE_H: i32 = 16;
 
@@ -43,6 +49,12 @@ impl TileBins {
     #[inline]
     pub fn num_tiles(&self) -> usize {
         (self.num_tiles_x * self.num_tiles_y) as usize
+    }
+}
+
+impl Default for TileBins {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -208,7 +220,7 @@ pub fn project(
                     return None;
                 }
                 let k2 = (2.0 * (s.opacity / alpha_threshold).ln()).min(max_k2);
-                if !(k2 > 0.0) {
+                if k2.partial_cmp(&0.0) != Some(std::cmp::Ordering::Greater) {
                     return None;
                 }
 
@@ -282,6 +294,8 @@ pub fn sort_by_depth(projected: &mut [Projected], scratch: &mut ScratchBuffers) 
     scratch
         .sort_aux
         .reserve(n.saturating_sub(scratch.sort_aux.capacity()));
+    // Radix passes overwrite every element; avoid zeroing for allocation cost.
+    #[allow(clippy::uninit_vec)]
     unsafe {
         scratch.sort_aux.set_len(n);
     }
@@ -480,6 +494,7 @@ pub fn composite_tiled(
 }
 
 #[inline]
+#[allow(clippy::too_many_arguments)]
 unsafe fn composite_splat_region(
     p: &Projected,
     fb_ptr: *mut (Vec3, f32),
