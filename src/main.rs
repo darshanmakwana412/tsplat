@@ -25,6 +25,11 @@ use hud::{DisplayInfo, HudAction, HudState};
 use rasterize::{ScratchBuffers, build_thread_pool, composite_parallel, project, sort_by_depth_parallel};
 use splat::{Splat, load_ply};
 
+/// HUD default `rotation_speed`; auto-orbit scales it to this angular velocity (rad/s)
+/// when that slider is at its default, so teaser capture stays ~one slow turn per 12s.
+const AUTO_ORBIT_RAD_PER_SEC_AT_DEFAULT_ROT_SPEED: f32 = 0.5;
+const AUTO_ORBIT_ROT_SPEED_REF: f32 = 0.035;
+
 #[derive(ClapParser, Debug)]
 #[command(
     name = "tsplat",
@@ -166,6 +171,8 @@ fn main() -> Result<()> {
     let mut thread_pool = build_thread_pool(hud.num_threads);
     let mut last_num_threads = hud.num_threads;
     let mut scratch = ScratchBuffers::new();
+    let mut auto_orbit = false;
+    let mut last_wallclock = Instant::now();
 
     loop {
         // ---- apply deferred resize ----
@@ -191,6 +198,18 @@ fn main() -> Result<()> {
             // A reload flushed a text bar to stdout that the next frame must
             // wipe; also the scene pixels have actually changed.
             display.queue_text_clear();
+            needs_redraw = true;
+        }
+
+        // ---- time-based auto orbit (for screen capture / teaser clips) ----
+        let now = Instant::now();
+        let mut dt = now.duration_since(last_wallclock).as_secs_f32();
+        last_wallclock = now;
+        dt = dt.min(0.25);
+        if auto_orbit {
+            let omega = hud.rotation_speed
+                * (AUTO_ORBIT_RAD_PER_SEC_AT_DEFAULT_ROT_SPEED / AUTO_ORBIT_ROT_SPEED_REF);
+            camera.orbit(omega * dt, 0.0);
             needs_redraw = true;
         }
 
@@ -223,7 +242,11 @@ fn main() -> Result<()> {
                 frames_since_report = 0;
                 last_fps_report = now;
             }
-            let fps_str = format!(" FPS {:5.1} ", fps);
+            let fps_str = if auto_orbit {
+                format!(" FPS {:5.1} ORBIT ", fps)
+            } else {
+                format!(" FPS {:5.1} ", fps)
+            };
             let col = (display.cols as usize)
                 .saturating_sub(fps_str.chars().count())
                 .max(0)
@@ -248,7 +271,12 @@ fn main() -> Result<()> {
         // ~50ms "feels instant" threshold without ever spinning. When events
         // do arrive, poll returns immediately, so this does not cap the
         // interactive frame rate.
-        if !event::poll(Duration::from_millis(33))? {
+        let poll_wait = if auto_orbit {
+            Duration::from_millis(16)
+        } else {
+            Duration::from_millis(33)
+        };
+        if !event::poll(poll_wait)? {
             continue;
         }
 
@@ -334,6 +362,11 @@ fn main() -> Result<()> {
                     KeyCode::Char('d') | KeyCode::Char('D') => {
                         let step = camera.radius * hud.translate_speed;
                         camera.pan(step, 0.0);
+                        needs_redraw = true;
+                    }
+                    KeyCode::Char('o') | KeyCode::Char('O') => {
+                        auto_orbit = !auto_orbit;
+                        last_wallclock = Instant::now();
                         needs_redraw = true;
                     }
                     // Arrows: HUD when open, else camera orbit (same mapping as J/K and H/L).
