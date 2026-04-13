@@ -1,29 +1,84 @@
 # tsplat
 
-Run Gaussian Splatting in your terminal, works over SSH, and supports xterm, kitty, GNOME, Konsole, it's fast, written in rust and is CPU only
+> Run Gaussian Splatting in your terminal, CPU only, even works over SSH
 
-![](./assets/view.png)
+![demo screenshot](./assets/view.png)
+
+tsplat renders [3D Gaussian Splatting](https://repo-sam.inria.fr/fungraph/3d-gaussian-splatting/) scenes directly in your terminal using Unicode half-blocks or any supported graphics protocol. written in rust and is CPU only for now, doesn't require GPU or display servers and it even works over SSH
 
 ## Installation
 
-```bash
-cargo install --git 
+Requires Rust
+```sh
+cargo install --git https://github.com/darshanmakwana412/tsplat
 ```
+
+Or clone and build locally:
+
+```sh
+git clone https://github.com/darshanmakwana412/tsplat
+cd tsplat
+cargo build --release
+```
+
+## Quick start
+
+You need an INRIA 3DGS `.ply` scene. The [pretrained garden scene](https://repo-sam.inria.fr/fungraph/3d-gaussian-splatting/) is a good first test:
+
+```sh
+tsplat path/to/scene.ply
+
+# Raise or remove the default 200 k splat cap
+tsplat path/to/scene.ply --max-splats 500000
+tsplat path/to/scene.ply --no-cap
+
+# Scene looks washed-out when
+tsplat path/to/scene.ply --raw-opacity
+```
+
+> Note: If you terminal does not support any graphics protocol it will fallback to half block rendering which might look minecrafty
+
+## Controls
+
+| Key | Action |
+|-----|--------|
+| `W` `A` `S` `D` | Pan (camera-relative) |
+| `J` / `K` or left/right arrows | Yaw left / right |
+| `H` / `L` or up/down arrows | Pitch up / down |
+| `+` / `-` or mouse scroll | Zoom in / out |
+| `O` | Toggle **auto-orbit** (smooth yaw loop, ideal for recordings) |
+| `Tab` | Toggle HUD — arrows navigate rows and adjust values while open |
+| `q` / `Esc` / `Ctrl-C` | Quit |
+
+## Benchmarks
+
+```sh
+cargo run --release --bin bench_forward
+cargo run --release --bin bench_forward -- --threads 1,2,4,8 --splats 200000
+cargo run --release --bin bench_forward -- --ply path/to/scene.ply
+```
+
+---
 
 ## Tutorial on Gaussian Splatting
 
 I recently discovered some of my notes related to it and decided to digitize it this weekend, along the way I reimplemented the forward rasterization pass in rust and decided it would be fun to write a tutorial explaining gaussian splatting to everyone, so here it is
 
-- [What is a splat?](#what-is-a-gaussian-splat)
+- [What is a gaussian splat?](#what-is-a-gaussian-splat)
 - [The forward pass pipeline](#the-forward-pass-pipeline)
-- [step 1: Projecting Splats](#step-1-projecting-splats)
-- [step 2: transform into view space](#step-2-transform-into-view-space)
-- [step 3: project to 2D (the Jacobian)](#step-3-project-to-2d-the-jacobian)
-- [step 4: compute bounding boxes](#step-4-compute-bounding-boxes)
-- [step 5: depth sort](#step-5-depth-sort)
-- [step 6: tile binning](#step-6-tile-binning)
-- [step 7: alpha compositing](#step-7-alpha-compositing)
-- [the optimizations](#the-optimizations)
+- [Step 1: Projecting Splats](#step-1-projecting-splats)
+  - [1.1: building the 3D covariance matrix](#11-building-the-3d-covariance-matrix)
+  - [1.2: transforming into view space](#12-transforming-into-view-space)
+  - [1.3: projecting to 2D](#13-projecting-to-2d)
+- [Step 2: computing bounding boxes](#step-2-computing-bounding-boxes)
+- [Step 3: depth sort](#step-3-depth-sort)
+- [Step 4: tile binning](#step-4-tile-binning)
+- [Step 5: alpha compositing](#step-5-alpha-compositing)
+  - [tiled parallel compositing](#tiled-parallel-compositing)
+- [Optimizations](#optimizations)
+  - [fast approximate exp](#fast-approximate-exp)
+  - [row-level early-out](#row-level-early-out)
+  - [scratch buffer reuse](#scratch-buffer-reuse)
 
 ## what is a gaussian splat?
 
